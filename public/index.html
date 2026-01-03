@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FoundryLocal Chat</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+    <style>
+        :root{
+            --bg:#091021;
+            --panel:#0f1720;
+            --muted:#9aa7b2;
+            --accent:#7dd3fc;
+            --user:#0ea5a8;
+            --ai:#60a5fa;
+            --border:#16232b;
+        }
+        html,body{height:100%;}
+        body {
+            font-family: Inter,Segoe UI,Arial,Helvetica,sans-serif;
+            max-width:900px;
+            margin: 0 auto;
+            padding: 24px;
+            background: linear-gradient(180deg,var(--bg),#051018);
+            color: #e6eef8;
+        }
+        h1{margin:0 0 12px 0;font-weight:600}
+        #container{display:flex;gap:16px;align-items:flex-start}
+        #left{flex:1}
+        #chat {
+            background:var(--panel);
+            border:1px solid var(--border);
+            height:520px;
+            overflow-y:auto;
+            padding:16px;
+            margin-bottom:12px;
+            border-radius:8px;
+            box-shadow: 0 6px 20px rgba(2,6,23,0.6);
+        }
+        .message{margin-bottom:14px;display:block;max-width:85%}
+        .message .bubble{padding:12px 14px;border-radius:10px;word-wrap:break-word;white-space:pre-wrap}
+        .user{margin-left:auto;text-align:right}
+        .user .bubble{background:linear-gradient(90deg,var(--user),#06b6b4);color:#021014;border-bottom-right-radius:2px}
+        .assistant{margin-right:auto;text-align:left}
+        .assistant .bubble{background:linear-gradient(90deg,#071329,var(--ai));color:#e6eef8;border-bottom-left-radius:2px}
+        #controls{display:flex;gap:8px;align-items:center}
+        #messageInput{flex:1;padding:4px 8px;border-radius:8px;border:1px solid var(--border);background:#061124;color:var(--muted);font-size:13px;height:28px;line-height:1.1}
+        #sendButton{padding:4px 8px;border-radius:8px;border:none;background:var(--accent);color:#012;cursor:pointer;font-size:13px;height:28px;line-height:1.1}
+        #stopButton{display:inline-block;background:#ff8b8b;color:#200;border-radius:8px;padding:4px 8px;border:none;cursor:pointer;margin-left:4px;font-size:13px;height:28px;line-height:1.1}
+        #loadLog{background:#03121a;border:1px solid #0b2733;color:var(--muted);padding:10px;border-radius:8px;margin-top:8px;max-height:160px;overflow:auto;font-family:monospace;font-size:13px}
+        /* Spinner overlay */
+        #spinnerOverlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(2,6,11,0.6); z-index: 9999; }
+        .spinner { width:48px; height:48px; border-radius:50%; border:4px solid rgba(255,255,255,0.12); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        select{padding:8px;border-radius:8px;border:1px solid var(--border);background:#071424;color:var(--muted);font-size:13px;-webkit-appearance:none;-moz-appearance:none;appearance:none;padding-right:12px}
+        /* Ensure top action controls match the chat input/button height */
+        select, #downloadButton, #removeButton { font-size:13px; height:28px; line-height:1.1; padding:4px 8px; }
+        /* Hide the native dropdown arrow on Windows/Chromium/Firefox */
+        select::-ms-expand { display: none; }
+        select::-webkit-appearance: none;
+        /* Match the Available Models toggle/button to the select control */
+        .dropdown-toggle {
+            padding:8px;
+            border-radius:8px;
+            border:1px solid var(--border);
+            background:#071424;
+            color:var(--muted);
+            text-align:left;
+            min-width:0;
+            font-family: inherit;
+            font-size: 13px;
+            cursor: pointer;
+            line-height:1.2;
+            display:inline-flex;
+            align-items:center;
+            gap:8px;
+            width:auto;
+        }
+        .server-dropdown {
+            display:none;
+            position:absolute;
+            right:12px;
+            top:48px;
+            background:var(--panel);
+            border:1px solid var(--border);
+            padding:8px;
+            border-radius:8px;
+            max-height:260px;
+            overflow:auto;
+            z-index:10000;
+            min-width:0;
+            white-space:nowrap;
+            font-family: inherit;
+            font-size: 13px;
+            color:var(--muted);
+        }
+        .server-row{padding:6px;display:flex;align-items:center;gap:12px}
+        .server-row label{flex:1;color:var(--muted);font-size:inherit}
+        .small{font-size:13px;color:var(--muted)}
+        code{background:#071423;padding:2px 6px;border-radius:4px;color:var(--accent)}
+    </style>
+</head>
+<body>
+    <h1>Microsoft Foundry Local Chat</h1>
+    <div id="container">
+        <div id="left">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px; justify-content:space-between">
+                <div style="display:flex;align-items:center;gap:12px">
+                    <label class="small" for="modelSelect">Local</label>
+                    <select id="modelSelect"><option>Loading models...</option></select>
+                </div>
+                <div style="display:flex;align-items:center;gap:12px;position:relative">
+                    <div id="serverModelWrapper" style="display:flex;align-items:center;gap:8px">
+                        <label class="small" for="serverModelSelect">Cloud</label>
+                        <select id="serverModelSelect"><option>Loading...</option></select>
+                    </div>
+                        <button id="downloadButton" style="padding:6px 8px;border-radius:8px;border:none;background:#34d399;color:#012;cursor:pointer;margin-left:8px;font-size:13px;min-width:80px">Download</button>
+                            <button id="removeButton" style="padding:6px 8px;border-radius:8px;border:none;background:#f87171;color:#200;cursor:pointer;margin-left:8px;font-size:13px;min-width:72px">Off-load</button>
+                </div>
+            </div>
+            <div id="loadContainer" style="display:none">
+                <div class="small">Model load log:</div>
+                <div id="loadLog"></div>
+                <div id="downloadProgress" style="display:none;margin-top:8px">
+                    <div style="display:flex;align-items:center;gap:8px">
+                        <progress id="progressBar" value="0" max="100" style="flex:1;height:12px;border-radius:6px"></progress>
+                        <div id="progressText" class="small">0%</div>
+                    </div>
+                    <div id="progressLine" class="small" style="font-family:monospace;margin-top:6px;color:var(--muted)"></div>
+                </div>
+            </div>
+            <div id="chat" role="log" aria-live="polite"></div>
+            <div id="controls">
+                <input type="text" id="messageInput" placeholder="Type your message...">
+                <button id="sendButton">Send</button>
+                <button id="stopButton" style="padding:6px 8px;border-radius:8px;border:none;background:#ff8b8b;color:#200;cursor:pointer;margin-left:4px;font-size:13px;min-width:72px">Stop</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="spinnerOverlay">
+        <div class="spinner" aria-hidden="true"></div>
+    </div>
+
+    <script>
+        const chatDiv = document.getElementById('chat');
+        const messageInput = document.getElementById('messageInput');
+        const sendButton = document.getElementById('sendButton');
+        const modelSelect = document.getElementById('modelSelect');
+
+        let currentModel = '';
+
+        // Load available models
+        async function loadModels() {
+            try {
+                const response = await fetch('/models');
+                const data = await response.json();
+                modelSelect.innerHTML = '';
+                // placeholder option
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                    placeholder.textContent = 'Chat with model...';
+                placeholder.disabled = true;
+                // Only select placeholder if no currentModel
+                if (!currentModel) placeholder.selected = true;
+                modelSelect.appendChild(placeholder);
+                // populate options
+                data.models.forEach(model => {
+                    const option = document.createElement('option');
+                    option.value = model.alias;
+                    option.textContent = model.alias + (model.loaded ? ' (loaded)' : ' (cached)');
+                    option.dataset.loaded = model.loaded ? '1' : '0';
+                    modelSelect.appendChild(option);
+                });
+                // After populating, if we have a currentModel, select it and enable controls if loaded
+                if (currentModel) {
+                    const opt = Array.from(modelSelect.options).find(o => o.value === currentModel);
+                    if (opt) {
+                        opt.selected = true;
+                        if (opt.dataset.loaded === '1') {
+                            sendButton.disabled = false;
+                            messageInput.disabled = false;
+                        } else {
+                            sendButton.disabled = true;
+                            messageInput.disabled = true;
+                        }
+                    } else {
+                        // if currentModel isn't in list, disable controls
+                        sendButton.disabled = true;
+                        messageInput.disabled = true;
+                    }
+                } else {
+                    // default: disabled until user picks a model
+                    sendButton.disabled = true;
+                    messageInput.disabled = true;
+                }
+            } catch (error) {
+                console.error('Error loading models:', error);
+                modelSelect.innerHTML = '<option value="">Error loading models</option>';
+            }
+            // also populate server models list
+            loadServerModels();
+        }
+
+        let loadEventSource = null;
+        let isLoadingModel = false;
+        let downloadEventSource = null;
+
+        modelSelect.addEventListener('change', async () => {
+            const selectedModel = modelSelect.value;
+            if (selectedModel === currentModel) return;
+                // if no selection or placeholder, ignore
+            if (!selectedModel) return;
+            // if option already loaded, still call /load so server can unload others
+            const opt = modelSelect.options[modelSelect.selectedIndex];
+
+            // record previous loaded option so we can mark it cached after unload
+            const prevAlias = currentModel;
+            const prevOpt = prevAlias ? Array.from(modelSelect.options).find(o => o.value === prevAlias) : null;
+
+            // start loading model via SSE
+            try {
+                // show loading state in option
+                if (opt) opt.textContent = selectedModel + ' (loading...)';
+                const modelId = await loadModel(selectedModel);
+                // mark option as loaded (remove cached label)
+                if (opt) {
+                    opt.dataset.loaded = '1';
+                    opt.textContent = selectedModel + ' (loaded)';
+                }
+
+                // mark previous option as cached (it was unloaded on the server)
+                if (prevOpt) {
+                    prevOpt.dataset.loaded = '0';
+                    prevOpt.textContent = prevAlias + ' (cached)';
+                }
+
+                // update currentModel and enable chat
+                currentModel = selectedModel;
+                chatDiv.innerHTML = '';
+                addMessage('system', `Switched to model: ${selectedModel}`);
+                // refresh models from server to reflect true loaded/cached state
+                await loadModels();
+            } catch (e) {
+                addMessage('system', `Failed to load model: ${e}`);
+            }
+        });
+
+        // Load server-available models into the right dropdown
+        async function loadServerModels() {
+            const select = document.getElementById('serverModelSelect');
+            const downloadBtn = document.getElementById('downloadButton');
+            if (!select) return console.error('serverModelSelect element not found');
+            // show loading placeholder and disable control while fetching
+            select.innerHTML = '';
+                const loadingOpt = document.createElement('option');
+                loadingOpt.value = '';
+                loadingOpt.textContent = 'Download/Off-load model...';
+                loadingOpt.disabled = true;
+                loadingOpt.selected = true;
+            select.appendChild(loadingOpt);
+            select.disabled = true;
+            if (downloadBtn) downloadBtn.disabled = true;
+            try {
+                const resp = await fetch('/server-models');
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const data = await resp.json();
+                select.innerHTML = '';
+                if (!data.models || data.models.length === 0) {
+                    const none = document.createElement('option');
+                    none.value = '';
+                    none.textContent = 'No models available';
+                    none.disabled = true;
+                    none.selected = true;
+                    select.appendChild(none);
+                    select.disabled = true;
+                    if (downloadBtn) downloadBtn.disabled = true;
+                    return;
+                }
+                // placeholder
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.textContent = 'Download/Off-load model...';
+                placeholder.disabled = true;
+                placeholder.selected = true;
+                select.appendChild(placeholder);
+                data.models.forEach((m) => {
+                    // Skip header-like rows that may come from server output
+                    if (m && m.alias && /^alias\b/i.test(String(m.alias)) && (!m.device || m.device === '-' )) return;
+                    const opt = document.createElement('option');
+                    opt.value = m.alias;
+                    opt.textContent = `${m.alias} | ${m.device || '-'} | ${m.task || '-'} | ${m.fileSize || '-'} | ${m.license || '-'}`;
+                    opt.dataset.downloaded = m.downloaded ? '1' : '0';
+                    if (m.downloaded) opt.textContent = '* ' + opt.textContent;
+                    select.appendChild(opt);
+                });
+                select.disabled = false;
+                if (downloadBtn) downloadBtn.disabled = false;
+                // initialize button states
+                updateServerButtons();
+            } catch (e) {
+                console.error('Error loading server models', e);
+                select.innerHTML = '';
+                const errOpt = document.createElement('option');
+                errOpt.value = '';
+                errOpt.textContent = 'Error loading models';
+                errOpt.disabled = true;
+                errOpt.selected = true;
+                select.appendChild(errOpt);
+                select.disabled = true;
+                if (downloadBtn) downloadBtn.disabled = true;
+            }
+        }
+
+        // Server models select helper
+        const serverModelSelect = document.getElementById('serverModelSelect');
+
+        function updateServerButtons(){
+            const downloadBtn = document.getElementById('downloadButton');
+            const removeBtn = document.getElementById('removeButton');
+            const sel = serverModelSelect.value;
+            if (!sel) {
+                if (downloadBtn) downloadBtn.disabled = true;
+                if (removeBtn) removeBtn.disabled = true;
+                return;
+            }
+            const opt = Array.from(serverModelSelect.options).find(o=>o.value===sel);
+                const downloaded = opt && opt.dataset && opt.dataset.downloaded === '1';
+                // Download should be enabled when NOT downloaded; Remove enabled only when downloaded
+                if (downloadBtn) downloadBtn.disabled = !!downloaded;
+                if (removeBtn) removeBtn.disabled = !downloaded;
+        }
+
+        serverModelSelect.addEventListener('change', updateServerButtons);
+
+        // Download selected server model (single-select)
+        document.getElementById('downloadButton').addEventListener('click', async () => {
+            const sel = serverModelSelect.value;
+            if (!sel) return alert('Select a model to download');
+            clearLoadLog();
+            showLoadContainer(true);
+            document.getElementById('downloadButton').disabled = true;
+            // Start SSE to /download with a single alias
+            const aliasesParam = encodeURIComponent(sel);
+            downloadEventSource = new EventSource(`/download?aliases=${aliasesParam}`);
+            downloadEventSource.onmessage = (ev) => {
+                try {
+                    const d = JSON.parse(ev.data);
+                    if (d.progress !== undefined) {
+                        // structured progress event
+                        const val = Number(d.progress);
+                        const pb = document.getElementById('progressBar');
+                        const pt = document.getElementById('progressText');
+                        const pl = document.getElementById('progressLine');
+                        if (pb && pt) {
+                            pb.value = Math.min(100, Math.max(0, val));
+                            pt.textContent = pb.value.toFixed(2) + '%';
+                            document.getElementById('downloadProgress').style.display = 'block';
+                            if (d.progressLine && pl) pl.textContent = d.progressLine;
+                        }
+                        // don't append structured percent lines to the raw log
+                    } else {
+                        if (d.log) appendLoadLog(d.log);
+                        if (d.error) appendLoadLog('ERROR: ' + d.error + (d.stderr ? '\n' + d.stderr : ''));
+                        if (d.done) {
+                            appendLoadLog('Download complete.');
+                            downloadEventSource.close();
+                            downloadEventSource = null;
+                            document.getElementById('downloadButton').disabled = false;
+                            showLoadContainer(false);
+                            // hide progress UI
+                            document.getElementById('downloadProgress').style.display = 'none';
+                            // refresh both lists
+                            loadModels();
+                            loadServerModels();
+                        }
+                    }
+                } catch (e) { appendLoadLog('parse error'); }
+            };
+            downloadEventSource.onerror = (ev) => {
+                appendLoadLog('(download connection error)');
+                downloadEventSource.close();
+                downloadEventSource = null;
+                document.getElementById('downloadButton').disabled = false;
+                showLoadContainer(false);
+            };
+        });
+
+        // Remove selected server model from cache (with confirm)
+        document.getElementById('removeButton').addEventListener('click', async () => {
+            const sel = serverModelSelect.value;
+            if (!sel) return alert('Select a model to remove');
+            const ok = confirm(`Remove model ${sel} from local cache? This cannot be undone.`);
+            if (!ok) return;
+            clearLoadLog();
+            showLoadContainer(true);
+            appendLoadLog(`Removing ${sel} from cache...`);
+            try {
+                const resp = await fetch('/cache-remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ alias: sel }) });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    appendLoadLog('ERROR: ' + (data.error || 'Failed to remove'));
+                } else {
+                    appendLoadLog(data.stdout || 'Removed (no output)');
+                    if (data.stderr) appendLoadLog('STDERR:\n' + data.stderr);
+                    // refresh lists
+                    loadModels();
+                    loadServerModels();
+                }
+            } catch (e) {
+                appendLoadLog('ERROR: ' + e.message);
+            } finally {
+                showLoadContainer(false);
+            }
+        });
+
+        const MAX_LOG_LINES = 500;
+        let logBuffer = [];
+
+        function renderLog() {
+            const log = document.getElementById('loadLog');
+            // keep only the last MAX_LOG_LINES in buffer
+            if (logBuffer.length > MAX_LOG_LINES) logBuffer = logBuffer.slice(logBuffer.length - MAX_LOG_LINES);
+            log.innerText = logBuffer.join('\n') + (logBuffer.length ? '\n' : '');
+            log.scrollTop = log.scrollHeight;
+        }
+
+        function appendLoadLog(line){
+            const raw = String(line).replace(/\r/g,'');
+            logBuffer.push(raw);
+            renderLog();
+        }
+
+        // Detect whether a log line contains a download percentage (e.g. "12%", "0.01 %", or "Downloading 12%")
+        function isProgressLine(text){
+            if (!text) return false;
+            // remove ANSI escape sequences and trim
+            const clean = String(text).replace(/\x1b\[[0-9;]*m/g, '').trim();
+            // normalize multiple spaces
+            const norm = clean.replace(/\s+/g, ' ');
+            // match numbers like 12, 12.3 with optional space before % (e.g. '0.01 %')
+            if (/\b\d{1,3}(?:\.\d+)?\s*%\b/.test(norm)) return true;
+            if (/progress[:]?\s*\d{1,3}(?:\.\d+)?\s*%/i.test(norm)) return true;
+            if (/downloading.*\d{1,3}(?:\.\d+)?\s*%/i.test(norm)) return true;
+            return false;
+        }
+
+        // Append a download progress line but replace the most recent progress line instead of adding another
+        function appendOrReplaceProgress(line){
+            const raw = String(line).replace(/\r/g,'');
+            // search backwards for the most recent progress-like line in buffer
+            let foundIndex = -1;
+            for (let j = logBuffer.length - 1; j >= 0; j--) {
+                try {
+                    const entry = String(logBuffer[j] || '').replace(/\x1b\[[0-9;]*m/g, '');
+                    // if line contains a bracket progress bar or matches percentage patterns
+                    if (/\[\s*-*\s*\]/.test(entry) || isProgressLine(entry)) { foundIndex = j; break; }
+                } catch (e) {
+                    // ignore malformed buffer entries
+                }
+            }
+            if (foundIndex >= 0) {
+                logBuffer[foundIndex] = raw;
+            } else {
+                logBuffer.push(raw);
+            }
+            renderLog();
+        }
+
+        function clearLoadLog(){ logBuffer = []; renderLog(); }
+
+        function showLoadContainer(show){
+            document.getElementById('loadContainer').style.display = show ? 'block' : 'none';
+        }
+
+        function loadModel(alias){
+            return new Promise((resolve, reject)=>{
+                if (isLoadingModel && loadEventSource) {
+                    loadEventSource.close();
+                    loadEventSource = null;
+                }
+                clearLoadLog();
+                showLoadContainer(true);
+                showSpinner(true);
+                isLoadingModel = true;
+                sendButton.disabled = true;
+                messageInput.disabled = true;
+                modelSelect.disabled = true;
+
+                loadEventSource = new EventSource(`/load?alias=${encodeURIComponent(alias)}`);
+
+                loadEventSource.onmessage = (ev) => {
+                    try{
+                        const d = JSON.parse(ev.data);
+                        if (d.log) appendLoadLog(d.log);
+                        if (d.unloaded) {
+                            // mark option for unloaded alias as cached
+                            const unloadedOpt = Array.from(modelSelect.options).find(o => o.value === d.unloaded);
+                            if (unloadedOpt) {
+                                unloadedOpt.dataset.loaded = '0';
+                                unloadedOpt.textContent = d.unloaded + ' (cached)';
+                            }
+                            appendLoadLog(`(server) unloaded: ${d.unloaded}`);
+                        }
+                        if (d.error){ appendLoadLog('ERROR: '+d.error); }
+                        if (d.done){
+                            appendLoadLog('Model ready.');
+                            loadEventSource.close();
+                            loadEventSource = null;
+                            isLoadingModel = false;
+                                sendButton.disabled = false;
+                                messageInput.disabled = false;
+                                modelSelect.disabled = false;
+                                showLoadContainer(false);
+                                showSpinner(false);
+                                resolve(d.modelId);
+                        }
+                    }catch(e){ appendLoadLog('parse error'); }
+                };
+
+                loadEventSource.onerror = (ev) => {
+                    appendLoadLog('(connection error)');
+                    loadEventSource.close();
+                    loadEventSource = null;
+                    isLoadingModel = false;
+                    sendButton.disabled = false;
+                    messageInput.disabled = false;
+                    modelSelect.disabled = false;
+                    showLoadContainer(false);
+                    showSpinner(false);
+                    reject('Connection error');
+                };
+            });
+        }
+
+        function showSpinner(visible){
+            const s = document.getElementById('spinnerOverlay');
+            if (!s) return;
+            s.style.display = visible ? 'flex' : 'none';
+        }
+
+        window.onload = loadModels;
+
+        function escapeHtml(str){
+            return str.replace(/[&<>\"]/g, (c)=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+        }
+
+        function renderMathAndText(text){
+            // Handle block $$...$$ first
+            // Normalize LaTeX delimiters: \[ \] -> $$ $$, \( \) -> $ $
+            text = text.replace(/\\\[(.*?)\\\]/gs, "$$$1$$");
+            text = text.replace(/\\\((.*?)\\\)/gs, "$ $1$");
+            let html = '';
+            // Split by $$ blocks
+            const parts = text.split(/\$\$(.*?)\$\$/s);
+            for (let i=0;i<parts.length;i++){
+                if (i%2===1){
+                    try{
+                        html += katex.renderToString(parts[i], {displayMode:true});
+                    }catch(e){ html += '<pre>'+escapeHtml(parts[i])+'</pre>'; }
+                } else {
+                    // handle inline $...$
+                    const inl = parts[i].split(/\$(.*?)\$/s);
+                    for (let j=0;j<inl.length;j++){
+                        if (j%2===1){
+                            try{ html += katex.renderToString(inl[j], {displayMode:false}); }catch(e){ html += '<code>'+escapeHtml(inl[j])+'</code>'; }
+                        } else {
+                            html += escapeHtml(inl[j]).replace(/\n/g,'<br>');
+                        }
+                    }
+                }
+            }
+            return html;
+        }
+
+        function addMessage(role, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            if (role === 'user') bubble.innerHTML = '<strong>You:</strong> ' + escapeHtml(content);
+            else if (role === 'assistant') bubble.innerHTML = '<strong>AI:</strong> ' + renderMathAndText(content);
+            else bubble.innerHTML = '<strong>System:</strong> ' + escapeHtml(content);
+            messageDiv.appendChild(bubble);
+            chatDiv.appendChild(messageDiv);
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const message = messageInput.value.trim();
+            if (!message) return;
+
+            addMessage('user', message);
+            messageInput.value = '';
+
+            const assistantWrapper = document.createElement('div');
+            assistantWrapper.className = 'message assistant';
+            const assistantBubble = document.createElement('div');
+            assistantBubble.className = 'bubble';
+            assistantBubble.innerHTML = '<strong>AI:</strong> ';
+            assistantWrapper.appendChild(assistantBubble);
+            chatDiv.appendChild(assistantWrapper);
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+
+            const selectedModel = modelSelect.value;
+            // show spinner while waiting for the model to start sending tokens
+            showSpinner(true);
+            const eventSource = new EventSource(`/chat?message=${encodeURIComponent(message)}&model=${encodeURIComponent(selectedModel)}`);
+
+            let assistantBuffer = '';
+            let firstChunkReceived = false;
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                if (data.content) {
+                    // hide spinner on first received content so user can Stop mid-stream
+                    if (!firstChunkReceived) {
+                        firstChunkReceived = true;
+                        showSpinner(false);
+                    }
+                    assistantBuffer += data.content;
+                    // re-render the whole assistant bubble to avoid partial-math rendering
+                    assistantBubble.innerHTML = '<strong>AI:</strong> ' + renderMathAndText(assistantBuffer);
+                    chatDiv.scrollTop = chatDiv.scrollHeight;
+                } else if (data.done) {
+                    // hide spinner when model finishes (in case no content ever arrived)
+                    showSpinner(false);
+                    eventSource.close();
+                } else if (data.error) {
+                    assistantBubble.innerHTML += `<em>Error: ${escapeHtml(data.error)}</em>`;
+                    showSpinner(false);
+                    eventSource.close();
+                }
+            };
+
+            eventSource.onerror = function() {
+                assistantBubble.innerHTML += ' <em>(Connection error)</em>';
+                showSpinner(false);
+                eventSource.close();
+            };
+
+            // Stop button logic: close the EventSource and disable controls briefly
+            const stopButton = document.getElementById('stopButton');
+            function stopStream() {
+                if (eventSource) {
+                    eventSource.close();
+                    assistantBubble.innerHTML += ' <em>(Stopped)</em>';
+                }
+                // hide spinner when user stops generation
+                showSpinner(false);
+                sendButton.disabled = false;
+                messageInput.disabled = false;
+            }
+            stopButton.onclick = stopStream;
+        }
+
+        sendButton.addEventListener('click', sendMessage);
+        messageInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+</html>
