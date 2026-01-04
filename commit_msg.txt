@@ -1,0 +1,14 @@
+feat: enhance model loading with specific ID support & UI formatting
+
+Updates the chat server to handle specific Model IDs for precise variant loading (e.g. GPU vs CPU vs NPU) and improves error handling/timeouts.
+
+**Server (`chat_server.js`):**
+- **Model ID Tracking:** Updated `/models` and `/server-models` to parse and track unique `Model ID`s alongside aliases.
+- **Specific Loading:** Refactored `/load` endpoint to require and use `modelId` to ensure the exact requested model variant is loaded.
+- **Unloading Logic:** Improved unloading to target specific `modelId`s, preventing accidental unloading of desired models if they share an alias.
+- **SDK & Endpoint Fallbacks:** Added timeouts for SDK initialization and a fallback to the default Foundry service endpoint if init fails or times out.
+- **Cache Removal:** Updated `/cache-remove` to support removing by `modelId` and attempting to unload the model first.
+
+**Client (`public/index.html`):**
+- **Formatting:** Applied Prettier-style formatting to CSS and HTML structure for better readability.
+- **Visuals:** Minor CSS variable adjustments for consistent theming.

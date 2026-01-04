@@ -1,0 +1,1326 @@
+diff --git a/chat_server.js b/chat_server.js
+index 341cd0c..97571dd 100644
+--- a/chat_server.js
++++ b/chat_server.js
+@@ -106,19 +106,22 @@ try {
+     const line = svcLines[i].trim();
+     if (line.startsWith('🟢')) {
+       const parts = line.split(/\s+/);
+-      if (parts.length >= 2) toUnload.push(parts[1]);
++      if (parts.length >= 3) {
++        const loadedModelId = parts.slice(2).join(' '); // Get the Model ID, not alias
++        toUnload.push(loadedModelId);
++      }
+     }
+   }
+-  for (const alias of toUnload) {
++  for (const loadedModelId of toUnload) {
+     try {
+-      console.log(`Unloading at startup: foundry model unload ${alias}`);
+-      const child = exec(`foundry model unload ${alias}`);
++      console.log(`Unloading at startup: foundry model unload ${loadedModelId}`);
++      const child = exec(`foundry model unload ${loadedModelId}`);
+       child.stdout.on('data', (d) => console.log('startup unload stdout:', d.toString()));
+       child.stderr.on('data', (d) => console.error('startup unload stderr:', d.toString()));
+       await new Promise((resolve, reject) => child.on('close', (code) => code === 0 ? resolve() : reject(new Error('code ' + code))));
+-      console.log(`Startup: unloaded ${alias}`);
++      console.log(`Startup: unloaded ${loadedModelId}`);
+     } catch (e) {
+-      console.error('Error unloading at startup for', alias, e);
++      console.error('Error unloading at startup for', loadedModelId, e);
+     }
+   }
+ } catch (e) {
+@@ -135,12 +138,64 @@ const foundryLocalManager = new FoundryLocalManager();
+ let conversation = [];
+ 
+ // Serve static UI files from ./public
+-app.use(express.json());
++app.use(express.json({
++  verify: (req, res, buf) => {
++    req.rawBody = buf.toString();
++  }
++}));
++app.use((err, req, res, next) => {
++  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
++    console.error('Bad JSON:', err.message, 'Raw:', req.rawBody);
++    return res.status(400).send({ status: 400, message: err.message });
++  }
++  next();
++});
+ app.use(express.static('public'));
+ 
+ // API endpoint to get available models (only those loaded in service)
+ app.get('/models', async (req, res) => {
+   try {
++    // First, get full model list to build a lookup by Model ID
++    // Model list format: Alias, Device, Task, File Size, License, Model ID
++    const modelListOut = await execAsync('foundry model list');
++    const modelLines = modelListOut.stdout.split('\n');
++    const modelInfoByModelId = new Map(); // modelId -> { alias, device, task, fileSize, license }
++    let currentAlias = '';
++    for (const raw of modelLines) {
++      const line = raw.trim();
++      if (!line || line.startsWith('-')) continue; // skip empty lines and separators
++
++      // Non-indented lines have the alias at the start
++      if (!raw.startsWith(' ')) {
++        const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
++        if (parts.length >= 6) {
++          // Full line: Alias Device Task FileSize License ModelID
++          currentAlias = parts[0];
++          const device = parts[1] || '';
++          const task = parts[2] || '';
++          const fileSize = parts[3] || '';
++          const license = parts[4] || '';
++          const modelId = parts[5] || '';
++          if (modelId) {
++            modelInfoByModelId.set(modelId, { alias: currentAlias, device, task, fileSize, license });
++          }
++        }
++      } else {
++        // Indented variant lines: Device Task FileSize License ModelID
++        const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
++        if (parts.length >= 5 && currentAlias) {
++          const device = parts[0] || '';
++          const task = parts[1] || '';
++          const fileSize = parts[2] || '';
++          const license = parts[3] || '';
++          const modelId = parts[4] || '';
++          if (modelId) {
++            modelInfoByModelId.set(modelId, { alias: currentAlias, device, task, fileSize, license });
++          }
++        }
++      }
++    }
++
+     // Build list from cache and mark which are loaded
+     const cacheOut = await execAsync('foundry cache list');
+     const cacheLines = cacheOut.stdout.trim().split('\n');
+@@ -152,7 +207,25 @@ app.get('/models', async (req, res) => {
+         if (parts.length >= 3) {
+           const alias = parts[1];
+           const modelId = parts.slice(2).join(' ');
+-          cached.push({ alias, id: modelId, loaded: false });
++          // Look up the model info by modelId to get the correct device/task/size
++          const info = modelInfoByModelId.get(modelId) || {};
++          // Fallback: extract device from modelId if not found in lookup
++          let device = info.device || '';
++          if (!device && modelId) {
++            const modelIdLower = modelId.toLowerCase();
++            if (modelIdLower.includes('-npu')) device = 'NPU';
++            else if (modelIdLower.includes('-gpu')) device = 'GPU';
++            else if (modelIdLower.includes('-cpu')) device = 'CPU';
++          }
++          cached.push({
++            alias,
++            id: modelId,
++            loaded: false,
++            device: device,
++            task: info.task || '',
++            fileSize: info.fileSize || '',
++            license: info.license || ''
++          });
+         }
+       }
+     }
+@@ -165,13 +238,29 @@ app.get('/models', async (req, res) => {
+         const parts = line.split(/\s+/);
+         if (parts.length >= 3) {
+           const alias = parts[1];
+-          // mark cached entry as loaded if present
+-          const entry = cached.find((c) => c.alias === alias);
++          const modelId = parts.slice(2).join(' ');
++          // Find the cached entry by modelId (not alias) for correct variant matching
++          const entry = cached.find((c) => c.id === modelId);
+           if (entry) entry.loaded = true;
+           else {
+             // if not cached, still expose as loaded
+-            const modelId = parts.slice(2).join(' ');
+-            cached.push({ alias, id: modelId, loaded: true });
++            const info = modelInfoByModelId.get(modelId) || {};
++            let device = info.device || '';
++            if (!device && modelId) {
++              const modelIdLower = modelId.toLowerCase();
++              if (modelIdLower.includes('-npu')) device = 'NPU';
++              else if (modelIdLower.includes('-gpu')) device = 'GPU';
++              else if (modelIdLower.includes('-cpu')) device = 'CPU';
++            }
++            cached.push({
++              alias,
++              id: modelId,
++              loaded: true,
++              device: device,
++              task: info.task || '',
++              fileSize: info.fileSize || '',
++              license: info.license || ''
++            });
+           }
+         }
+       }
+@@ -183,13 +272,15 @@ app.get('/models', async (req, res) => {
+   }
+ });
+ 
+-// Track currently loaded alias
++// Track currently loaded model
+ let currentLoadedAlias = null;
++let currentLoadedModelId = null;
+ 
+ // SSE endpoint to load a model on-demand. Streams load/unload progress.
+ app.get('/load', async (req, res) => {
++  const modelId = req.query.modelId; // Full model ID for loading specific variant
+   const alias = req.query.alias;
+-  if (!alias) return res.status(400).json({ error: 'alias required' });
++  if (!modelId || !alias) return res.status(400).json({ error: 'modelId and alias required' });
+ 
+   res.setHeader('Content-Type', 'text/event-stream');
+   res.setHeader('Cache-Control', 'no-cache');
+@@ -204,40 +295,44 @@ app.get('/load', async (req, res) => {
+   }
+ 
+   try {
+-    console.log('/load called for alias:', alias);
+-    // Check if alias already loaded in service
++    console.log('/load called for modelId:', modelId, 'alias:', alias);
++    // Check if the specific modelId is already loaded in service
+     let alreadyLoadedId = await findModelInService(alias);
+ 
+-    // Unload any loaded models other than the requested alias to free memory
++    // Unload any loaded models other than the requested modelId to free memory
+     try {
+       const { stdout: svcOut } = await execAsync('foundry service list');
+       console.log('foundry service list (before unload):\n', svcOut);
+       const svcLines = svcOut.trim().split('\n');
+-      const loadedAliases = [];
++      const loadedModels = []; // { alias, loadedModelId }
+       for (let i = 2; i < svcLines.length; i++) {
+         const line = svcLines[i].trim();
+         if (line.startsWith('🟢')) {
+           const parts = line.split(/\s+/);
+-          if (parts.length >= 2) loadedAliases.push(parts[1]);
++          if (parts.length >= 3) {
++            const loadedAlias = parts[1];
++            const loadedModelId = parts.slice(2).join(' ');
++            loadedModels.push({ alias: loadedAlias, modelId: loadedModelId });
++          }
+         }
+       }
+-      // Unload all loaded aliases except the requested one
+-      for (const la of loadedAliases) {
+-        if (la === alias) continue;
+-        sendEvent({ log: `Unloading model present in service: ${la}` });
+-        console.log(`Running: foundry model unload ${la}`);
++      // Unload all loaded models except the requested one (compare by modelId)
++      for (const lm of loadedModels) {
++        if (lm.modelId === modelId) continue; // Don't unload the one we want
++        sendEvent({ log: `Unloading model present in service: ${lm.modelId}` });
++        console.log(`Running: foundry model unload ${lm.modelId}`);
+         await new Promise((resolve, reject) => {
+-          const child = exec(`foundry model unload ${la}`);
++          const child = exec(`foundry model unload ${lm.modelId}`);
+           child.stdout.on('data', (d) => { sendEvent({ log: d.toString() }); console.log('unload stdout:', d.toString()); });
+           child.stderr.on('data', (d) => { sendEvent({ log: d.toString() }); console.error('unload stderr:', d.toString()); });
+-          child.on('close', (code) => { console.log(`foundry model unload ${la} exited with code ${code}`); code === 0 ? resolve() : reject(new Error('unload code ' + code)); });
++          child.on('close', (code) => { console.log(`foundry model unload ${lm.modelId} exited with code ${code}`); code === 0 ? resolve() : reject(new Error('unload code ' + code)); });
+           child.on('error', (err) => { console.error('unload error:', err); reject(err); });
+         });
+-        sendEvent({ log: `Unloaded ${la}` });
++        sendEvent({ log: `Unloaded ${lm.modelId}` });
+         // explicitly tell client which alias was unloaded
+-        sendEvent({ unloaded: la });
+-        console.log(`Unloaded model ${la}`);
+-        if (currentLoadedAlias === la) currentLoadedAlias = null;
++        sendEvent({ unloaded: lm.alias });
++        console.log(`Unloaded model ${lm.modelId}`);
++        if (currentLoadedAlias === lm.alias) currentLoadedAlias = null;
+       }
+       // Wait until all other aliases are gone from service list (small propagation delay)
+       const unloadTimeout = 60000; // 60s
+@@ -262,9 +357,10 @@ app.get('/load', async (req, res) => {
+       sendEvent({ log: 'Warning: error while unloading previous models: ' + e.message });
+     }
+ 
+-    // If model already present in service, skip load step
+-    if (alreadyLoadedId) {
+-      sendEvent({ log: `Model ${alias} already loaded as ${alreadyLoadedId}` });
++
++    // If the exact model is already present in service, skip load step
++    if (alreadyLoadedId === modelId) {
++      sendEvent({ log: `Model ${modelId} already loaded` });
+       try { await foundryLocalManager.init(alias); } catch (e) { sendEvent({ log: 'Warning: SDK init failed: ' + e.message }); }
+       currentLoadedAlias = alias;
+       sendEvent({ done: true, modelId: alreadyLoadedId });
+@@ -272,43 +368,56 @@ app.get('/load', async (req, res) => {
+       return;
+     }
+ 
+-    // Start loading requested model
+-    sendEvent({ log: `Loading model: ${alias}` });
+-    console.log(`Running: foundry model load ${alias}`);
++    // Start loading requested model by modelId (to get specific variant)
++    sendEvent({ log: `Loading model: ${modelId}` });
++    console.log(`Running: foundry model load ${modelId}`);
+     await new Promise((resolve, reject) => {
+-      const child = exec(`foundry model load ${alias}`);
++      const child = exec(`foundry model load ${modelId}`);
+       child.stdout.on('data', (d) => { sendEvent({ log: d.toString() }); console.log('load stdout:', d.toString()); });
+       child.stderr.on('data', (d) => { sendEvent({ log: d.toString() }); console.error('load stderr:', d.toString()); });
+-      child.on('close', (code) => { console.log(`foundry model load ${alias} exited with code ${code}`); code === 0 ? resolve() : reject(new Error('load code ' + code)); });
++      child.on('close', (code) => { console.log(`foundry model load ${modelId} exited with code ${code}`); code === 0 ? resolve() : reject(new Error('load code ' + code)); });
+       child.on('error', (err) => { console.error('load error:', err); reject(err); });
+     });
+ 
+     // Poll service list until alias appears
++    console.log('Starting to poll service list for alias:', alias);
+     const timeoutMs = 120000;
+     const intervalMs = 1000;
+     const start = Date.now();
+-    let modelId = null;
++    let loadedModelId = null;
+     while (Date.now() - start < timeoutMs) {
+-      const id = await findModelInService(alias).catch(()=>null);
+-      if (id) { modelId = id; break; }
+-      await new Promise(r=>setTimeout(r, intervalMs));
++      const id = await findModelInService(alias).catch(() => null);
++      console.log('Poll result:', id);
++      if (id) { loadedModelId = id; break; }
++      await new Promise(r => setTimeout(r, intervalMs));
+     }
+-    if (!modelId) {
++    console.log('Polling complete, loadedModelId:', loadedModelId);
++    if (!loadedModelId) {
+       sendEvent({ error: 'Model did not appear in service after loading' });
+       res.end();
+       return;
+     }
+ 
+-    // Initialize via SDK
++    // Initialize via SDK with a timeout
++    console.log('Initializing SDK with alias:', alias);
+     try {
+-      await foundryLocalManager.init(alias);
++      const initTimeout = 10000; // 10 second timeout
++      await Promise.race([
++        foundryLocalManager.init(alias),
++        new Promise((_, reject) => setTimeout(() => reject(new Error('SDK init timed out')), initTimeout))
++      ]);
++      console.log('SDK init complete');
+     } catch (e) {
+-      sendEvent({ log: 'Warning: SDK init failed: ' + e.message });
++      console.log('SDK init failed or timed out:', e.message);
++      sendEvent({ log: 'Warning: SDK init issue: ' + e.message + ' (continuing anyway)' });
+     }
+ 
++    console.log('Sending done event');
+     currentLoadedAlias = alias;
+-    sendEvent({ done: true, modelId });
++    currentLoadedModelId = loadedModelId;
++    sendEvent({ done: true, modelId: loadedModelId });
+     res.end();
++    console.log('Response ended');
+   } catch (e) {
+     console.error('Error in /load:', e);
+     sendEvent({ error: e.message || String(e) });
+@@ -329,29 +438,35 @@ app.get('/chat', async (req, res) => {
+   let selectedAlias = aliasRequested;
+   let modelId = null;
+ 
+-  // Helper to check service list for alias and return modelId if loaded
+-  async function findModelInService(alias) {
+-    const { stdout } = await execAsync('foundry service list');
+-    const lines = stdout.trim().split('\n');
+-    for (let i = 2; i < lines.length; i++) {
+-      const line = lines[i].trim();
+-      if (line.startsWith('🟢')) {
+-        const parts = line.split(/\s+/);
+-        if (parts.length >= 3) {
+-          const a = parts[1];
+-          const id = parts.slice(2).join(' ');
+-          if (a === alias) return id;
++  // First check if we have a currently loaded model matching the alias
++  if (currentLoadedAlias === aliasRequested && currentLoadedModelId) {
++    modelId = currentLoadedModelId;
++    console.log('Using tracked loaded model:', modelId);
++  } else {
++    // Helper to check service list for alias and return modelId if loaded
++    async function findModelInService(alias) {
++      const { stdout } = await execAsync('foundry service list');
++      const lines = stdout.trim().split('\n');
++      for (let i = 2; i < lines.length; i++) {
++        const line = lines[i].trim();
++        if (line.startsWith('🟢')) {
++          const parts = line.split(/\s+/);
++          if (parts.length >= 3) {
++            const a = parts[1];
++            const id = parts.slice(2).join(' ');
++            if (a === alias) return id;
++          }
+         }
+       }
++      return null;
+     }
+-    return null;
+-  }
+ 
+-  try {
+-    modelId = await findModelInService(selectedAlias);
+-  } catch (error) {
+-    console.error('Error checking service list:', error);
+-    return res.status(500).json({ error: 'Failed to check service list' });
++    try {
++      modelId = await findModelInService(selectedAlias);
++    } catch (error) {
++      console.error('Error checking service list:', error);
++      return res.status(500).json({ error: 'Failed to check service list' });
++    }
+   }
+ 
+   // If not loaded, check cache and load
+@@ -411,17 +526,36 @@ app.get('/chat', async (req, res) => {
+     }
+   }
+ 
+-  // Init the selected model to get the correct endpoint
++  // Init the selected model to get the correct endpoint (with timeout)
++  let endpoint = null;
+   try {
+-    await foundryLocalManager.init(selectedAlias);
++    const initTimeout = 5000; // 5 second timeout
++    await Promise.race([
++      foundryLocalManager.init(selectedAlias),
++      new Promise((_, reject) => setTimeout(() => reject(new Error('SDK init timed out')), initTimeout))
++    ]);
++    endpoint = foundryLocalManager.endpoint;
+   } catch (error) {
+-    console.error('Error initializing model:', error);
+-    return res.status(500).json({ error: 'Failed to initialize model' });
++    console.error('Error initializing model (will use fallback endpoint):', error.message);
++  }
++
++  // Fallback: use the default Foundry service endpoint
++  if (!endpoint) {
++    try {
++      const statusOutput = await execAsync('foundry service status');
++      const portMatch = statusOutput.stdout.match(/http:\/\/127\.0\.0\.1:(\d+)\//);
++      const servicePort = portMatch ? portMatch[1] : '49808';
++      endpoint = `http://127.0.0.1:${servicePort}/v1`;
++      console.log('Using fallback endpoint:', endpoint);
++    } catch (e) {
++      endpoint = 'http://127.0.0.1:49808/v1';
++      console.log('Using default endpoint:', endpoint);
++    }
+   }
+ 
+   // Create OpenAI client with the model's endpoint
+   const openai = new OpenAI({
+-    baseURL: foundryLocalManager.endpoint,
++    baseURL: endpoint,
+     apiKey: 'not-needed',
+   });
+ 
+@@ -495,28 +629,42 @@ app.get('/server-models', async (req, res) => {
+     const lines = stdout.split('\n');
+     const entries = [];
+     // parsing: lines include blocks per alias; look for lines with alias at column start
++    let currentAlias = '';
+     for (const raw of lines) {
+       const line = raw.trim();
+-      if (!line) continue;
++      if (!line || line.startsWith('-')) continue; // skip empty and separator lines
+       // match lines that start with an alias (non-indented)
+       if (!raw.startsWith(' ')) {
+         // alias line: Alias Device Task FileSize License ModelID
+         const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
+-        if (parts.length >= 5) {
+-          const alias = parts[0];
+-          // next fields may be device/task/filesize/license
++        if (parts.length >= 6) {
++          currentAlias = parts[0];
+           const device = parts[1] || '';
+           const task = parts[2] || '';
+           const fileSize = parts[3] || '';
+           const license = parts[4] || '';
+-          entries.push({ alias, device, task, fileSize, license, variants: [] });
++          const modelId = parts[5] || '';
++          // Create new entry with first variant from this line
++          entries.push({
++            alias: currentAlias,
++            variants: [{ device, task, fileSize, license, modelId }]
++          });
++        } else if (parts.length >= 1) {
++          // Might be a header or just alias - skip
++          currentAlias = parts[0];
+         }
+       } else {
+         // indented variant lines: Device Task FileSize License ModelID
+         const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
+         if (parts.length >= 5 && entries.length > 0) {
+           const last = entries[entries.length - 1];
+-          last.variants.push({ device: parts[0], task: parts[1], fileSize: parts[2], license: parts[3] });
++          last.variants.push({
++            device: parts[0],
++            task: parts[1],
++            fileSize: parts[2],
++            license: parts[3],
++            modelId: parts[4] || ''
++          });
+         }
+       }
+     }
+@@ -524,23 +672,30 @@ app.get('/server-models', async (req, res) => {
+     // Mark which of these are downloaded by checking cache list
+     const cacheOut = await execAsync('foundry cache list');
+     const cacheLines = cacheOut.stdout.split('\n');
+-    const cachedAliases = new Set();
++    const cachedModelIds = new Set();
+     for (const l of cacheLines) {
+       const li = l.trim();
+       if (li.startsWith('💾')) {
+         const p = li.split(/\s+/);
+-        if (p.length >= 2) cachedAliases.add(p[1]);
++        if (p.length >= 3) {
++          const cachedModelId = p.slice(2).join(' ');
++          cachedModelIds.add(cachedModelId);
++        }
+       }
+     }
+     // Expand entries to include variant rows for dropdown display
+     const flat = [];
+     for (const e of entries) {
+-      if (e.variants.length === 0) {
+-        flat.push({ alias: e.alias, device: '', task: '', fileSize: '', license: '', downloaded: cachedAliases.has(e.alias) });
+-      } else {
+-        for (const v of e.variants) {
+-          flat.push({ alias: e.alias, device: v.device, task: v.task, fileSize: v.fileSize, license: v.license, downloaded: cachedAliases.has(e.alias) });
+-        }
++      for (const v of e.variants) {
++        flat.push({
++          alias: e.alias,
++          device: v.device,
++          task: v.task,
++          fileSize: v.fileSize,
++          license: v.license,
++          modelId: v.modelId,
++          downloaded: cachedModelIds.has(v.modelId)
++        });
+       }
+     }
+ 
+@@ -739,14 +894,37 @@ app.get('/download', (req, res) => {
+   })();
+ });
+ 
+-// Endpoint to remove a model from the cache (safe, requires alias in body)
++// Endpoint to remove a model from the cache (safe, requires modelId or alias in body)
+ app.post('/cache-remove', async (req, res) => {
+   try {
++    console.log('/cache-remove received body:', req.body);
++    const modelId = req.body && req.body.modelId;
+     const alias = req.body && req.body.alias;
+-    if (!alias) return res.status(400).json({ error: 'alias required' });
+-    console.log(`Cache remove requested for alias: ${alias}`);
+-    // Use exec; include --yes to avoid prompt
+-    const cmd = `foundry cache remove ${alias} --yes`;
++    const target = modelId || alias;
++
++    if (!target) return res.status(400).json({ error: 'modelId required' });
++    console.log(`Cache remove requested for: ${target}`);
++
++    // First, unload this specific model from the service if loaded
++    try {
++      const { stdout: svcOut } = await execAsync('foundry service list');
++      if (svcOut.includes(target)) {
++        console.log(`Unloading ${target} before cache remove`);
++        await execAsync(`foundry model unload ${target}`);
++        console.log(`Unloaded ${target}`);
++        // Clear tracked model if it matches
++        if (currentLoadedModelId === target) {
++          currentLoadedAlias = null;
++          currentLoadedModelId = null;
++        }
++      }
++    } catch (unloadErr) {
++      console.log('Warning: error unloading before cache remove:', unloadErr.message);
++    }
++
++    // Now remove from cache using target (modelId)
++    // Note: Use exact ID to remove specific variant if supported, otherwise alias removes all
++    const cmd = `foundry cache remove ${target} --yes`;
+     try {
+       const { stdout, stderr } = await execAsync(cmd);
+       console.log('cache remove stdout:', stdout);
+@@ -754,8 +932,14 @@ app.post('/cache-remove', async (req, res) => {
+       res.json({ ok: true, stdout: stdout || '', stderr: stderr || '' });
+     } catch (e) {
+       console.error('Error running cache remove:', e);
+-      // include any output if present
+-      res.status(500).json({ ok: false, error: e.message || String(e), stdout: e.stdout || '', stderr: e.stderr || '' });
++      const stdout = e.stdout || '';
++      // Check if it actually deleted the model despite the error
++      if (stdout.includes('Deleted model') || stdout.includes('from the cache')) {
++        console.log('Model appeared to be deleted despite error. Treating as success.');
++        res.json({ ok: true, stdout: stdout, stderr: e.stderr || e.message, warning: 'Partial error during removal' });
++      } else {
++        res.status(500).json({ ok: false, error: e.message || String(e), stdout: stdout, stderr: e.stderr || '' });
++      }
+     }
+   } catch (err) {
+     console.error('Error in /cache-remove:', err);
+diff --git a/public/index.html b/public/index.html
+index bb464f8..f475cac 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -1,5 +1,6 @@
+ <!DOCTYPE html>
+ <html lang="en">
++
+ <head>
+     <meta charset="UTF-8">
+     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+@@ -7,100 +8,269 @@
+     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+     <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+     <style>
+-        :root{
+-            --bg:#091021;
+-            --panel:#0f1720;
+-            --muted:#9aa7b2;
+-            --accent:#7dd3fc;
+-            --user:#0ea5a8;
+-            --ai:#60a5fa;
+-            --border:#16232b;
+-        }
+-        html,body{height:100%;}
++        :root {
++            --bg: #091021;
++            --panel: #0f1720;
++            --muted: #9aa7b2;
++            --accent: #7dd3fc;
++            --user: #0ea5a8;
++            --ai: #60a5fa;
++            --border: #16232b;
++        }
++
++        html,
++        body {
++            height: 100%;
++        }
++
+         body {
+-            font-family: Inter,Segoe UI,Arial,Helvetica,sans-serif;
+-            max-width:900px;
++            font-family: Inter, Segoe UI, Arial, Helvetica, sans-serif;
++            max-width: 900px;
+             margin: 0 auto;
+             padding: 24px;
+-            background: linear-gradient(180deg,var(--bg),#051018);
++            background: linear-gradient(180deg, var(--bg), #051018);
+             color: #e6eef8;
+         }
+-        h1{margin:0 0 12px 0;font-weight:600}
+-        #container{display:flex;gap:16px;align-items:flex-start}
+-        #left{flex:1}
++
++        h1 {
++            margin: 0 0 12px 0;
++            font-weight: 600
++        }
++
++        #container {
++            display: flex;
++            gap: 16px;
++            align-items: flex-start
++        }
++
++        #left {
++            flex: 1
++        }
++
+         #chat {
+-            background:var(--panel);
+-            border:1px solid var(--border);
+-            height:520px;
+-            overflow-y:auto;
+-            padding:16px;
+-            margin-bottom:12px;
+-            border-radius:8px;
+-            box-shadow: 0 6px 20px rgba(2,6,23,0.6);
+-        }
+-        .message{margin-bottom:14px;display:block;max-width:85%}
+-        .message .bubble{padding:12px 14px;border-radius:10px;word-wrap:break-word;white-space:pre-wrap}
+-        .user{margin-left:auto;text-align:right}
+-        .user .bubble{background:linear-gradient(90deg,var(--user),#06b6b4);color:#021014;border-bottom-right-radius:2px}
+-        .assistant{margin-right:auto;text-align:left}
+-        .assistant .bubble{background:linear-gradient(90deg,#071329,var(--ai));color:#e6eef8;border-bottom-left-radius:2px}
+-        #controls{display:flex;gap:8px;align-items:center}
+-        #messageInput{flex:1;padding:4px 8px;border-radius:8px;border:1px solid var(--border);background:#061124;color:var(--muted);font-size:13px;height:28px;line-height:1.1}
+-        #sendButton{padding:4px 8px;border-radius:8px;border:none;background:var(--accent);color:#012;cursor:pointer;font-size:13px;height:28px;line-height:1.1}
+-        #stopButton{display:inline-block;background:#ff8b8b;color:#200;border-radius:8px;padding:4px 8px;border:none;cursor:pointer;margin-left:4px;font-size:13px;height:28px;line-height:1.1}
+-        #loadLog{background:#03121a;border:1px solid #0b2733;color:var(--muted);padding:10px;border-radius:8px;margin-top:8px;max-height:160px;overflow:auto;font-family:monospace;font-size:13px}
++            background: var(--panel);
++            border: 1px solid var(--border);
++            height: 520px;
++            overflow-y: auto;
++            padding: 16px;
++            margin-bottom: 12px;
++            border-radius: 8px;
++            box-shadow: 0 6px 20px rgba(2, 6, 23, 0.6);
++        }
++
++        .message {
++            margin-bottom: 14px;
++            display: block;
++            max-width: 85%
++        }
++
++        .message .bubble {
++            padding: 12px 14px;
++            border-radius: 10px;
++            word-wrap: break-word;
++            white-space: pre-wrap
++        }
++
++        .user {
++            margin-left: auto;
++            text-align: right
++        }
++
++        .user .bubble {
++            background: linear-gradient(90deg, var(--user), #06b6b4);
++            color: #021014;
++            border-bottom-right-radius: 2px
++        }
++
++        .assistant {
++            margin-right: auto;
++            text-align: left
++        }
++
++        .assistant .bubble {
++            background: linear-gradient(90deg, #071329, var(--ai));
++            color: #e6eef8;
++            border-bottom-left-radius: 2px
++        }
++
++        #controls {
++            display: flex;
++            gap: 8px;
++            align-items: center
++        }
++
++        #messageInput {
++            flex: 1;
++            padding: 4px 8px;
++            border-radius: 8px;
++            border: 1px solid var(--border);
++            background: #061124;
++            color: var(--muted);
++            font-size: 13px;
++            height: 28px;
++            line-height: 1.1
++        }
++
++        #sendButton {
++            padding: 4px 8px;
++            border-radius: 8px;
++            border: none;
++            background: var(--accent);
++            color: #012;
++            cursor: pointer;
++            font-size: 13px;
++            height: 28px;
++            line-height: 1.1
++        }
++
++        #stopButton {
++            display: inline-block;
++            background: #ff8b8b;
++            color: #200;
++            border-radius: 8px;
++            padding: 4px 8px;
++            border: none;
++            cursor: pointer;
++            margin-left: 4px;
++            font-size: 13px;
++            height: 28px;
++            line-height: 1.1
++        }
++
++        #loadLog {
++            background: #03121a;
++            border: 1px solid #0b2733;
++            color: var(--muted);
++            padding: 10px;
++            border-radius: 8px;
++            margin-top: 8px;
++            max-height: 160px;
++            overflow: auto;
++            font-family: monospace;
++            font-size: 13px
++        }
++
+         /* Spinner overlay */
+-        #spinnerOverlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(2,6,11,0.6); z-index: 9999; }
+-        .spinner { width:48px; height:48px; border-radius:50%; border:4px solid rgba(255,255,255,0.12); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+-        @keyframes spin { to { transform: rotate(360deg); } }
+-        select{padding:8px;border-radius:8px;border:1px solid var(--border);background:#071424;color:var(--muted);font-size:13px;-webkit-appearance:none;-moz-appearance:none;appearance:none;padding-right:12px}
++        #spinnerOverlay {
++            position: fixed;
++            inset: 0;
++            display: none;
++            align-items: center;
++            justify-content: center;
++            background: rgba(2, 6, 11, 0.6);
++            z-index: 9999;
++        }
++
++        .spinner {
++            width: 48px;
++            height: 48px;
++            border-radius: 50%;
++            border: 4px solid rgba(255, 255, 255, 0.12);
++            border-top-color: var(--accent);
++            animation: spin 0.8s linear infinite;
++        }
++
++        @keyframes spin {
++            to {
++                transform: rotate(360deg);
++            }
++        }
++
++        select {
++            padding: 8px;
++            border-radius: 8px;
++            border: 1px solid var(--border);
++            background: #071424;
++            color: var(--muted);
++            font-size: 13px;
++            -webkit-appearance: none;
++            -moz-appearance: none;
++            appearance: none;
++            padding-right: 12px
++        }
++
+         /* Ensure top action controls match the chat input/button height */
+-        select, #downloadButton, #removeButton { font-size:13px; height:28px; line-height:1.1; padding:4px 8px; }
++        select,
++        #downloadButton,
++        #removeButton {
++            font-size: 13px;
++            height: 28px;
++            line-height: 1.1;
++            padding: 4px 8px;
++        }
++
+         /* Hide the native dropdown arrow on Windows/Chromium/Firefox */
+-        select::-ms-expand { display: none; }
++        select::-ms-expand {
++            display: none;
++        }
++
+         select::-webkit-appearance: none;
++
+         /* Match the Available Models toggle/button to the select control */
+         .dropdown-toggle {
+-            padding:8px;
+-            border-radius:8px;
+-            border:1px solid var(--border);
+-            background:#071424;
+-            color:var(--muted);
+-            text-align:left;
+-            min-width:0;
++            padding: 8px;
++            border-radius: 8px;
++            border: 1px solid var(--border);
++            background: #071424;
++            color: var(--muted);
++            text-align: left;
++            min-width: 0;
+             font-family: inherit;
+             font-size: 13px;
+             cursor: pointer;
+-            line-height:1.2;
+-            display:inline-flex;
+-            align-items:center;
+-            gap:8px;
+-            width:auto;
++            line-height: 1.2;
++            display: inline-flex;
++            align-items: center;
++            gap: 8px;
++            width: auto;
+         }
++
+         .server-dropdown {
+-            display:none;
+-            position:absolute;
+-            right:12px;
+-            top:48px;
+-            background:var(--panel);
+-            border:1px solid var(--border);
+-            padding:8px;
+-            border-radius:8px;
+-            max-height:260px;
+-            overflow:auto;
+-            z-index:10000;
+-            min-width:0;
+-            white-space:nowrap;
++            display: none;
++            position: absolute;
++            right: 12px;
++            top: 48px;
++            background: var(--panel);
++            border: 1px solid var(--border);
++            padding: 8px;
++            border-radius: 8px;
++            max-height: 260px;
++            overflow: auto;
++            z-index: 10000;
++            min-width: 0;
++            white-space: nowrap;
+             font-family: inherit;
+             font-size: 13px;
+-            color:var(--muted);
++            color: var(--muted);
++        }
++
++        .server-row {
++            padding: 6px;
++            display: flex;
++            align-items: center;
++            gap: 12px
++        }
++
++        .server-row label {
++            flex: 1;
++            color: var(--muted);
++            font-size: inherit
++        }
++
++        .small {
++            font-size: 13px;
++            color: var(--muted)
++        }
++
++        code {
++            background: #071423;
++            padding: 2px 6px;
++            border-radius: 4px;
++            color: var(--accent)
+         }
+-        .server-row{padding:6px;display:flex;align-items:center;gap:12px}
+-        .server-row label{flex:1;color:var(--muted);font-size:inherit}
+-        .small{font-size:13px;color:var(--muted)}
+-        code{background:#071423;padding:2px 6px;border-radius:4px;color:var(--accent)}
+     </style>
+ </head>
++
+ <body>
+     <h1>Microsoft Foundry Local Chat</h1>
+     <div id="container">
+@@ -108,15 +278,21 @@
+             <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px; justify-content:space-between">
+                 <div style="display:flex;align-items:center;gap:12px">
+                     <label class="small" for="modelSelect">Local</label>
+-                    <select id="modelSelect"><option>Loading models...</option></select>
++                    <select id="modelSelect">
++                        <option>Loading models...</option>
++                    </select>
+                 </div>
+                 <div style="display:flex;align-items:center;gap:12px;position:relative">
+                     <div id="serverModelWrapper" style="display:flex;align-items:center;gap:8px">
+                         <label class="small" for="serverModelSelect">Cloud</label>
+-                        <select id="serverModelSelect"><option>Loading...</option></select>
++                        <select id="serverModelSelect">
++                            <option>Loading...</option>
++                        </select>
+                     </div>
+-                        <button id="downloadButton" style="padding:6px 8px;border-radius:8px;border:none;background:#34d399;color:#012;cursor:pointer;margin-left:8px;font-size:13px;min-width:80px">Download</button>
+-                            <button id="removeButton" style="padding:6px 8px;border-radius:8px;border:none;background:#f87171;color:#200;cursor:pointer;margin-left:8px;font-size:13px;min-width:72px">Off-load</button>
++                    <button id="downloadButton"
++                        style="padding:6px 8px;border-radius:8px;border:none;background:#34d399;color:#012;cursor:pointer;margin-left:8px;font-size:13px;min-width:80px">Download</button>
++                    <button id="removeButton"
++                        style="padding:6px 8px;border-radius:8px;border:none;background:#f87171;color:#200;cursor:pointer;margin-left:8px;font-size:13px;min-width:72px">Off-load</button>
+                 </div>
+             </div>
+             <div id="loadContainer" style="display:none">
+@@ -124,17 +300,20 @@
+                 <div id="loadLog"></div>
+                 <div id="downloadProgress" style="display:none;margin-top:8px">
+                     <div style="display:flex;align-items:center;gap:8px">
+-                        <progress id="progressBar" value="0" max="100" style="flex:1;height:12px;border-radius:6px"></progress>
++                        <progress id="progressBar" value="0" max="100"
++                            style="flex:1;height:12px;border-radius:6px"></progress>
+                         <div id="progressText" class="small">0%</div>
+                     </div>
+-                    <div id="progressLine" class="small" style="font-family:monospace;margin-top:6px;color:var(--muted)"></div>
++                    <div id="progressLine" class="small"
++                        style="font-family:monospace;margin-top:6px;color:var(--muted)"></div>
+                 </div>
+             </div>
+             <div id="chat" role="log" aria-live="polite"></div>
+             <div id="controls">
+                 <input type="text" id="messageInput" placeholder="Type your message...">
+                 <button id="sendButton">Send</button>
+-                <button id="stopButton" style="padding:6px 8px;border-radius:8px;border:none;background:#ff8b8b;color:#200;cursor:pointer;margin-left:4px;font-size:13px;min-width:72px">Stop</button>
++                <button id="stopButton"
++                    style="padding:6px 8px;border-radius:8px;border:none;background:#ff8b8b;color:#200;cursor:pointer;margin-left:4px;font-size:13px;min-width:72px">Stop</button>
+             </div>
+         </div>
+     </div>
+@@ -160,22 +339,27 @@
+                 // placeholder option
+                 const placeholder = document.createElement('option');
+                 placeholder.value = '';
+-                    placeholder.textContent = 'Chat with model...';
++                placeholder.textContent = 'Chat with model...';
+                 placeholder.disabled = true;
+                 // Only select placeholder if no currentModel
+                 if (!currentModel) placeholder.selected = true;
+                 modelSelect.appendChild(placeholder);
+-                // populate options
+                 data.models.forEach(model => {
+                     const option = document.createElement('option');
+-                    option.value = model.alias;
+-                    option.textContent = model.alias + (model.loaded ? ' (loaded)' : ' (cached)');
++                    option.value = model.id; // Use full modelId for unique identification
++                    option.dataset.alias = model.alias; // Store alias for loading
++                    // Build display text similar to cloud dropdown: alias | device | task | size | license
++                    const details = [model.device, model.task, model.fileSize, model.license].filter(Boolean).join(' | ');
++                    const status = model.loaded ? ' (loaded)' : ' (cached)';
++                    option.textContent = details ? `${model.alias} | ${details}${status}` : `${model.alias}${status}`;
+                     option.dataset.loaded = model.loaded ? '1' : '0';
+                     modelSelect.appendChild(option);
+                 });
+-                // After populating, if we have a currentModel, select it and enable controls if loaded
++                // After populating, if we have a currentModel (alias), select it and enable controls if loaded
+                 if (currentModel) {
+-                    const opt = Array.from(modelSelect.options).find(o => o.value === currentModel);
++                    // Find option by alias, preferring the loaded one
++                    const matchingOpts = Array.from(modelSelect.options).filter(o => o.dataset.alias === currentModel);
++                    let opt = matchingOpts.find(o => o.dataset.loaded === '1') || matchingOpts[0];
+                     if (opt) {
+                         opt.selected = true;
+                         if (opt.dataset.loaded === '1') {
+@@ -208,38 +392,40 @@
+         let downloadEventSource = null;
+ 
+         modelSelect.addEventListener('change', async () => {
+-            const selectedModel = modelSelect.value;
+-            if (selectedModel === currentModel) return;
+-                // if no selection or placeholder, ignore
+-            if (!selectedModel) return;
+-            // if option already loaded, still call /load so server can unload others
++            const selectedModelId = modelSelect.value; // This is now the full modelId
+             const opt = modelSelect.options[modelSelect.selectedIndex];
++            const selectedAlias = opt ? opt.dataset.alias : '';
++
++            if (!selectedModelId || !selectedAlias) return;
++            if (selectedAlias === currentModel) return; // currentModel tracks by alias
+ 
+             // record previous loaded option so we can mark it cached after unload
+             const prevAlias = currentModel;
+-            const prevOpt = prevAlias ? Array.from(modelSelect.options).find(o => o.value === prevAlias) : null;
++            const prevOpt = prevAlias ? Array.from(modelSelect.options).find(o => o.dataset.alias === prevAlias && o.dataset.loaded === '1') : null;
+ 
+             // start loading model via SSE
+             try {
+                 // show loading state in option
+-                if (opt) opt.textContent = selectedModel + ' (loading...)';
+-                const modelId = await loadModel(selectedModel);
++                const displayText = opt.textContent.replace(/ \(cached\)$| \(loaded\)$/, '');
++                if (opt) opt.textContent = displayText + ' (loading...)';
++                const loadedModelId = await loadModel(selectedModelId, selectedAlias); // Load by modelId
+                 // mark option as loaded (remove cached label)
+                 if (opt) {
+                     opt.dataset.loaded = '1';
+-                    opt.textContent = selectedModel + ' (loaded)';
++                    opt.textContent = displayText + ' (loaded)';
+                 }
+ 
+                 // mark previous option as cached (it was unloaded on the server)
+                 if (prevOpt) {
++                    const prevDisplayText = prevOpt.textContent.replace(/ \(cached\)$| \(loaded\)$| \(loading\.\.\.\)$/, '');
+                     prevOpt.dataset.loaded = '0';
+-                    prevOpt.textContent = prevAlias + ' (cached)';
++                    prevOpt.textContent = prevDisplayText + ' (cached)';
+                 }
+ 
+-                // update currentModel and enable chat
+-                currentModel = selectedModel;
++                // update currentModel (track by alias) and enable chat
++                currentModel = selectedAlias;
+                 chatDiv.innerHTML = '';
+-                addMessage('system', `Switched to model: ${selectedModel}`);
++                addMessage('system', `Switched to model: ${selectedAlias}`);
+                 // refresh models from server to reflect true loaded/cached state
+                 await loadModels();
+             } catch (e) {
+@@ -254,11 +440,11 @@
+             if (!select) return console.error('serverModelSelect element not found');
+             // show loading placeholder and disable control while fetching
+             select.innerHTML = '';
+-                const loadingOpt = document.createElement('option');
+-                loadingOpt.value = '';
+-                loadingOpt.textContent = 'Download/Off-load model...';
+-                loadingOpt.disabled = true;
+-                loadingOpt.selected = true;
++            const loadingOpt = document.createElement('option');
++            loadingOpt.value = '';
++            loadingOpt.textContent = 'Download/Off-load model...';
++            loadingOpt.disabled = true;
++            loadingOpt.selected = true;
+             select.appendChild(loadingOpt);
+             select.disabled = true;
+             if (downloadBtn) downloadBtn.disabled = true;
+@@ -287,9 +473,9 @@
+                 select.appendChild(placeholder);
+                 data.models.forEach((m) => {
+                     // Skip header-like rows that may come from server output
+-                    if (m && m.alias && /^alias\b/i.test(String(m.alias)) && (!m.device || m.device === '-' )) return;
++                    if (m && m.alias && /^alias\b/i.test(String(m.alias)) && (!m.device || m.device === '-')) return;
+                     const opt = document.createElement('option');
+-                    opt.value = m.alias;
++                    opt.value = m.modelId; // Use unique modelId instead of alias
+                     opt.textContent = `${m.alias} | ${m.device || '-'} | ${m.task || '-'} | ${m.fileSize || '-'} | ${m.license || '-'}`;
+                     opt.dataset.downloaded = m.downloaded ? '1' : '0';
+                     if (m.downloaded) opt.textContent = '* ' + opt.textContent;
+@@ -316,7 +502,7 @@
+         // Server models select helper
+         const serverModelSelect = document.getElementById('serverModelSelect');
+ 
+-        function updateServerButtons(){
++        function updateServerButtons() {
+             const downloadBtn = document.getElementById('downloadButton');
+             const removeBtn = document.getElementById('removeButton');
+             const sel = serverModelSelect.value;
+@@ -325,11 +511,11 @@
+                 if (removeBtn) removeBtn.disabled = true;
+                 return;
+             }
+-            const opt = Array.from(serverModelSelect.options).find(o=>o.value===sel);
+-                const downloaded = opt && opt.dataset && opt.dataset.downloaded === '1';
+-                // Download should be enabled when NOT downloaded; Remove enabled only when downloaded
+-                if (downloadBtn) downloadBtn.disabled = !!downloaded;
+-                if (removeBtn) removeBtn.disabled = !downloaded;
++            const opt = Array.from(serverModelSelect.options).find(o => o.value === sel);
++            const downloaded = opt && opt.dataset && opt.dataset.downloaded === '1';
++            // Download should be enabled when NOT downloaded; Remove enabled only when downloaded
++            if (downloadBtn) downloadBtn.disabled = !!downloaded;
++            if (removeBtn) removeBtn.disabled = !downloaded;
+         }
+ 
+         serverModelSelect.addEventListener('change', updateServerButtons);
+@@ -389,15 +575,16 @@
+ 
+         // Remove selected server model from cache (with confirm)
+         document.getElementById('removeButton').addEventListener('click', async () => {
+-            const sel = serverModelSelect.value;
+-            if (!sel) return alert('Select a model to remove');
+-            const ok = confirm(`Remove model ${sel} from local cache? This cannot be undone.`);
++            const selId = serverModelSelect.value;
++            if (!selId) return alert('Select a model to remove');
++            const ok = confirm(`Remove model ${serverModelSelect.options[serverModelSelect.selectedIndex].text}? This cannot be undone.`);
+             if (!ok) return;
+             clearLoadLog();
+             showLoadContainer(true);
+-            appendLoadLog(`Removing ${sel} from cache...`);
++            appendLoadLog(`Selecting ID: ${selId}`);
++            appendLoadLog(`Removing ${selId} from cache...`);
+             try {
+-                const resp = await fetch('/cache-remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ alias: sel }) });
++                const resp = await fetch('/cache-remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ modelId: selId }) });
+                 const data = await resp.json();
+                 if (!resp.ok) {
+                     appendLoadLog('ERROR: ' + (data.error || 'Failed to remove'));
+@@ -426,14 +613,14 @@
+             log.scrollTop = log.scrollHeight;
+         }
+ 
+-        function appendLoadLog(line){
+-            const raw = String(line).replace(/\r/g,'');
++        function appendLoadLog(line) {
++            const raw = String(line).replace(/\r/g, '');
+             logBuffer.push(raw);
+             renderLog();
+         }
+ 
+         // Detect whether a log line contains a download percentage (e.g. "12%", "0.01 %", or "Downloading 12%")
+-        function isProgressLine(text){
++        function isProgressLine(text) {
+             if (!text) return false;
+             // remove ANSI escape sequences and trim
+             const clean = String(text).replace(/\x1b\[[0-9;]*m/g, '').trim();
+@@ -447,8 +634,8 @@
+         }
+ 
+         // Append a download progress line but replace the most recent progress line instead of adding another
+-        function appendOrReplaceProgress(line){
+-            const raw = String(line).replace(/\r/g,'');
++        function appendOrReplaceProgress(line) {
++            const raw = String(line).replace(/\r/g, '');
+             // search backwards for the most recent progress-like line in buffer
+             let foundIndex = -1;
+             for (let j = logBuffer.length - 1; j >= 0; j--) {
+@@ -468,14 +655,14 @@
+             renderLog();
+         }
+ 
+-        function clearLoadLog(){ logBuffer = []; renderLog(); }
++        function clearLoadLog() { logBuffer = []; renderLog(); }
+ 
+-        function showLoadContainer(show){
++        function showLoadContainer(show) {
+             document.getElementById('loadContainer').style.display = show ? 'block' : 'none';
+         }
+ 
+-        function loadModel(alias){
+-            return new Promise((resolve, reject)=>{
++        function loadModel(modelId, alias) {
++            return new Promise((resolve, reject) => {
+                 if (isLoadingModel && loadEventSource) {
+                     loadEventSource.close();
+                     loadEventSource = null;
+@@ -488,35 +675,36 @@
+                 messageInput.disabled = true;
+                 modelSelect.disabled = true;
+ 
+-                loadEventSource = new EventSource(`/load?alias=${encodeURIComponent(alias)}`);
++                // Send both modelId and alias - server will use modelId to load specific variant
++                loadEventSource = new EventSource(`/load?modelId=${encodeURIComponent(modelId)}&alias=${encodeURIComponent(alias)}`);
+ 
+                 loadEventSource.onmessage = (ev) => {
+-                    try{
++                    try {
+                         const d = JSON.parse(ev.data);
+                         if (d.log) appendLoadLog(d.log);
+                         if (d.unloaded) {
+-                            // mark option for unloaded alias as cached
+-                            const unloadedOpt = Array.from(modelSelect.options).find(o => o.value === d.unloaded);
+-                            if (unloadedOpt) {
++                            // mark all options for unloaded alias as cached
++                            Array.from(modelSelect.options).filter(o => o.dataset.alias === d.unloaded).forEach(unloadedOpt => {
+                                 unloadedOpt.dataset.loaded = '0';
+-                                unloadedOpt.textContent = d.unloaded + ' (cached)';
+-                            }
++                                const displayText = unloadedOpt.textContent.replace(/ \(cached\)$| \(loaded\)$| \(loading\.\.\.\)$/, '');
++                                unloadedOpt.textContent = displayText + ' (cached)';
++                            });
+                             appendLoadLog(`(server) unloaded: ${d.unloaded}`);
+                         }
+-                        if (d.error){ appendLoadLog('ERROR: '+d.error); }
+-                        if (d.done){
++                        if (d.error) { appendLoadLog('ERROR: ' + d.error); }
++                        if (d.done) {
+                             appendLoadLog('Model ready.');
+                             loadEventSource.close();
+                             loadEventSource = null;
+                             isLoadingModel = false;
+-                                sendButton.disabled = false;
+-                                messageInput.disabled = false;
+-                                modelSelect.disabled = false;
+-                                showLoadContainer(false);
+-                                showSpinner(false);
+-                                resolve(d.modelId);
++                            sendButton.disabled = false;
++                            messageInput.disabled = false;
++                            modelSelect.disabled = false;
++                            showLoadContainer(false);
++                            showSpinner(false);
++                            resolve(d.modelId);
+                         }
+-                    }catch(e){ appendLoadLog('parse error'); }
++                    } catch (e) { appendLoadLog('parse error'); }
+                 };
+ 
+                 loadEventSource.onerror = (ev) => {
+@@ -534,7 +722,7 @@
+             });
+         }
+ 
+-        function showSpinner(visible){
++        function showSpinner(visible) {
+             const s = document.getElementById('spinnerOverlay');
+             if (!s) return;
+             s.style.display = visible ? 'flex' : 'none';
+@@ -542,11 +730,11 @@
+ 
+         window.onload = loadModels;
+ 
+-        function escapeHtml(str){
+-            return str.replace(/[&<>\"]/g, (c)=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
++        function escapeHtml(str) {
++            return str.replace(/[&<>\"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+         }
+ 
+-        function renderMathAndText(text){
++        function renderMathAndText(text) {
+             // Handle block $$...$$ first
+             // Normalize LaTeX delimiters: \[ \] -> $$ $$, \( \) -> $ $
+             text = text.replace(/\\\[(.*?)\\\]/gs, "$$$1$$");
+@@ -554,19 +742,19 @@
+             let html = '';
+             // Split by $$ blocks
+             const parts = text.split(/\$\$(.*?)\$\$/s);
+-            for (let i=0;i<parts.length;i++){
+-                if (i%2===1){
+-                    try{
+-                        html += katex.renderToString(parts[i], {displayMode:true});
+-                    }catch(e){ html += '<pre>'+escapeHtml(parts[i])+'</pre>'; }
++            for (let i = 0; i < parts.length; i++) {
++                if (i % 2 === 1) {
++                    try {
++                        html += katex.renderToString(parts[i], { displayMode: true });
++                    } catch (e) { html += '<pre>' + escapeHtml(parts[i]) + '</pre>'; }
+                 } else {
+                     // handle inline $...$
+                     const inl = parts[i].split(/\$(.*?)\$/s);
+-                    for (let j=0;j<inl.length;j++){
+-                        if (j%2===1){
+-                            try{ html += katex.renderToString(inl[j], {displayMode:false}); }catch(e){ html += '<code>'+escapeHtml(inl[j])+'</code>'; }
++                    for (let j = 0; j < inl.length; j++) {
++                        if (j % 2 === 1) {
++                            try { html += katex.renderToString(inl[j], { displayMode: false }); } catch (e) { html += '<code>' + escapeHtml(inl[j]) + '</code>'; }
+                         } else {
+-                            html += escapeHtml(inl[j]).replace(/\n/g,'<br>');
++                            html += escapeHtml(inl[j]).replace(/\n/g, '<br>');
+                         }
+                     }
+                 }
+@@ -603,14 +791,15 @@
+             chatDiv.appendChild(assistantWrapper);
+             chatDiv.scrollTop = chatDiv.scrollHeight;
+ 
+-            const selectedModel = modelSelect.value;
++            const selectedOpt = modelSelect.options[modelSelect.selectedIndex];
++            const selectedAlias = selectedOpt ? selectedOpt.dataset.alias : '';
+             // show spinner while waiting for the model to start sending tokens
+             showSpinner(true);
+-            const eventSource = new EventSource(`/chat?message=${encodeURIComponent(message)}&model=${encodeURIComponent(selectedModel)}`);
++            const eventSource = new EventSource(`/chat?message=${encodeURIComponent(message)}&model=${encodeURIComponent(selectedAlias)}`);
+ 
+             let assistantBuffer = '';
+             let firstChunkReceived = false;
+-            eventSource.onmessage = function(event) {
++            eventSource.onmessage = function (event) {
+                 const data = JSON.parse(event.data);
+                 if (data.content) {
+                     // hide spinner on first received content so user can Stop mid-stream
+@@ -633,7 +822,7 @@
+                 }
+             };
+ 
+-            eventSource.onerror = function() {
++            eventSource.onerror = function () {
+                 assistantBubble.innerHTML += ' <em>(Connection error)</em>';
+                 showSpinner(false);
+                 eventSource.close();
+@@ -662,4 +851,5 @@
+         });
+     </script>
+ </body>
++
+ </html>
+\ No newline at end of file

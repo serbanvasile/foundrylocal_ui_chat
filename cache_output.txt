@@ -1,0 +1,6 @@
+Models cached on device:
+   Alias                                             Model ID
+≡ƒÆ╛ qwen2.5-14b                                       qwen2.5-14b-instruct-generic-cpu:4
+≡ƒÆ╛ qwen2.5-7b                                        qwen2.5-7b-instruct-generic-cpu:4
+≡ƒÆ╛ qwen2.5-7b                                        qwen2.5-7b-instruct-openvino-gpu:2
+≡ƒÆ╛ qwen2.5-7b                                        qwen2.5-7b-instruct-openvino-npu:2

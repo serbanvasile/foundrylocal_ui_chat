@@ -1,0 +1,30 @@
+    // First, get full model list to have device/task/fileSize/license info
+    const modelListOut = await execAsync('foundry model list');
+    const modelLines = modelListOut.stdout.split('\n');
+    const modelInfo = new Map(); // alias -> { device, task, fileSize, license }
+    for (const raw of modelLines) {
+      const line = raw.trim();
+      if (!line) continue;
+      // match non-indented lines (main model entries)
+      if (!raw.startsWith(' ')) {
+        const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
+        if (parts.length >= 5) {
+          const alias = parts[0];
+          const device = parts[1] || '';
+          const task = parts[2] || '';
+          const fileSize = parts[3] || '';
+          const license = parts[4] || '';
+          modelInfo.set(alias, { device, task, fileSize, license });
+        }
+      }
+    }
+
+    // Build list from cache and mark which are loaded
+    const cacheOut = await execAsync('foundry cache list');
+    const cacheLines = cacheOut.stdout.trim().split('\n');
+    const cached = [];
+    for (let i = 2; i < cacheLines.length; i++) {
+      const line = cacheLines[i].trim();
+      if (line.startsWith('💾')) {
+        const parts = line.split(/\s+/);
+        if (parts.length >= 3) {

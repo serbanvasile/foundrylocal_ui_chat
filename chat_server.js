@@ -106,19 +106,22 @@ try {
     const line = svcLines[i].trim();
     if (line.startsWith('🟢')) {
       const parts = line.split(/\s+/);
-      if (parts.length >= 2) toUnload.push(parts[1]);
+      if (parts.length >= 3) {
+        const loadedModelId = parts.slice(2).join(' '); // Get the Model ID, not alias
+        toUnload.push(loadedModelId);
+      }
     }
   }
-  for (const alias of toUnload) {
+  for (const loadedModelId of toUnload) {
     try {
-      console.log(`Unloading at startup: foundry model unload ${alias}`);
-      const child = exec(`foundry model unload ${alias}`);
+      console.log(`Unloading at startup: foundry model unload ${loadedModelId}`);
+      const child = exec(`foundry model unload ${loadedModelId}`);
       child.stdout.on('data', (d) => console.log('startup unload stdout:', d.toString()));
       child.stderr.on('data', (d) => console.error('startup unload stderr:', d.toString()));
       await new Promise((resolve, reject) => child.on('close', (code) => code === 0 ? resolve() : reject(new Error('code ' + code))));
-      console.log(`Startup: unloaded ${alias}`);
+      console.log(`Startup: unloaded ${loadedModelId}`);
     } catch (e) {
-      console.error('Error unloading at startup for', alias, e);
+      console.error('Error unloading at startup for', loadedModelId, e);
     }
   }
 } catch (e) {
@@ -135,12 +138,64 @@ const foundryLocalManager = new FoundryLocalManager();
 let conversation = [];
 
 // Serve static UI files from ./public
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf.toString();
+  }
+}));
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    console.error('Bad JSON:', err.message, 'Raw:', req.rawBody);
+    return res.status(400).send({ status: 400, message: err.message });
+  }
+  next();
+});
 app.use(express.static('public'));
 
 // API endpoint to get available models (only those loaded in service)
 app.get('/models', async (req, res) => {
   try {
+    // First, get full model list to build a lookup by Model ID
+    // Model list format: Alias, Device, Task, File Size, License, Model ID
+    const modelListOut = await execAsync('foundry model list');
+    const modelLines = modelListOut.stdout.split('\n');
+    const modelInfoByModelId = new Map(); // modelId -> { alias, device, task, fileSize, license }
+    let currentAlias = '';
+    for (const raw of modelLines) {
+      const line = raw.trim();
+      if (!line || line.startsWith('-')) continue; // skip empty lines and separators
+
+      // Non-indented lines have the alias at the start
+      if (!raw.startsWith(' ')) {
+        const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
+        if (parts.length >= 6) {
+          // Full line: Alias Device Task FileSize License ModelID
+          currentAlias = parts[0];
+          const device = parts[1] || '';
+          const task = parts[2] || '';
+          const fileSize = parts[3] || '';
+          const license = parts[4] || '';
+          const modelId = parts[5] || '';
+          if (modelId) {
+            modelInfoByModelId.set(modelId, { alias: currentAlias, device, task, fileSize, license });
+          }
+        }
+      } else {
+        // Indented variant lines: Device Task FileSize License ModelID
+        const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
+        if (parts.length >= 5 && currentAlias) {
+          const device = parts[0] || '';
+          const task = parts[1] || '';
+          const fileSize = parts[2] || '';
+          const license = parts[3] || '';
+          const modelId = parts[4] || '';
+          if (modelId) {
+            modelInfoByModelId.set(modelId, { alias: currentAlias, device, task, fileSize, license });
+          }
+        }
+      }
+    }
+
     // Build list from cache and mark which are loaded
     const cacheOut = await execAsync('foundry cache list');
     const cacheLines = cacheOut.stdout.trim().split('\n');
@@ -152,7 +207,25 @@ app.get('/models', async (req, res) => {
         if (parts.length >= 3) {
           const alias = parts[1];
           const modelId = parts.slice(2).join(' ');
-          cached.push({ alias, id: modelId, loaded: false });
+          // Look up the model info by modelId to get the correct device/task/size
+          const info = modelInfoByModelId.get(modelId) || {};
+          // Fallback: extract device from modelId if not found in lookup
+          let device = info.device || '';
+          if (!device && modelId) {
+            const modelIdLower = modelId.toLowerCase();
+            if (modelIdLower.includes('-npu')) device = 'NPU';
+            else if (modelIdLower.includes('-gpu')) device = 'GPU';
+            else if (modelIdLower.includes('-cpu')) device = 'CPU';
+          }
+          cached.push({
+            alias,
+            id: modelId,
+            loaded: false,
+            device: device,
+            task: info.task || '',
+            fileSize: info.fileSize || '',
+            license: info.license || ''
+          });
         }
       }
     }
@@ -165,13 +238,29 @@ app.get('/models', async (req, res) => {
         const parts = line.split(/\s+/);
         if (parts.length >= 3) {
           const alias = parts[1];
-          // mark cached entry as loaded if present
-          const entry = cached.find((c) => c.alias === alias);
+          const modelId = parts.slice(2).join(' ');
+          // Find the cached entry by modelId (not alias) for correct variant matching
+          const entry = cached.find((c) => c.id === modelId);
           if (entry) entry.loaded = true;
           else {
             // if not cached, still expose as loaded
-            const modelId = parts.slice(2).join(' ');
-            cached.push({ alias, id: modelId, loaded: true });
+            const info = modelInfoByModelId.get(modelId) || {};
+            let device = info.device || '';
+            if (!device && modelId) {
+              const modelIdLower = modelId.toLowerCase();
+              if (modelIdLower.includes('-npu')) device = 'NPU';
+              else if (modelIdLower.includes('-gpu')) device = 'GPU';
+              else if (modelIdLower.includes('-cpu')) device = 'CPU';
+            }
+            cached.push({
+              alias,
+              id: modelId,
+              loaded: true,
+              device: device,
+              task: info.task || '',
+              fileSize: info.fileSize || '',
+              license: info.license || ''
+            });
           }
         }
       }
@@ -183,13 +272,15 @@ app.get('/models', async (req, res) => {
   }
 });
 
-// Track currently loaded alias
+// Track currently loaded model
 let currentLoadedAlias = null;
+let currentLoadedModelId = null;
 
 // SSE endpoint to load a model on-demand. Streams load/unload progress.
 app.get('/load', async (req, res) => {
+  const modelId = req.query.modelId; // Full model ID for loading specific variant
   const alias = req.query.alias;
-  if (!alias) return res.status(400).json({ error: 'alias required' });
+  if (!modelId || !alias) return res.status(400).json({ error: 'modelId and alias required' });
 
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -204,40 +295,44 @@ app.get('/load', async (req, res) => {
   }
 
   try {
-    console.log('/load called for alias:', alias);
-    // Check if alias already loaded in service
+    console.log('/load called for modelId:', modelId, 'alias:', alias);
+    // Check if the specific modelId is already loaded in service
     let alreadyLoadedId = await findModelInService(alias);
 
-    // Unload any loaded models other than the requested alias to free memory
+    // Unload any loaded models other than the requested modelId to free memory
     try {
       const { stdout: svcOut } = await execAsync('foundry service list');
       console.log('foundry service list (before unload):\n', svcOut);
       const svcLines = svcOut.trim().split('\n');
-      const loadedAliases = [];
+      const loadedModels = []; // { alias, loadedModelId }
       for (let i = 2; i < svcLines.length; i++) {
         const line = svcLines[i].trim();
         if (line.startsWith('🟢')) {
           const parts = line.split(/\s+/);
-          if (parts.length >= 2) loadedAliases.push(parts[1]);
+          if (parts.length >= 3) {
+            const loadedAlias = parts[1];
+            const loadedModelId = parts.slice(2).join(' ');
+            loadedModels.push({ alias: loadedAlias, modelId: loadedModelId });
+          }
         }
       }
-      // Unload all loaded aliases except the requested one
-      for (const la of loadedAliases) {
-        if (la === alias) continue;
-        sendEvent({ log: `Unloading model present in service: ${la}` });
-        console.log(`Running: foundry model unload ${la}`);
+      // Unload all loaded models except the requested one (compare by modelId)
+      for (const lm of loadedModels) {
+        if (lm.modelId === modelId) continue; // Don't unload the one we want
+        sendEvent({ log: `Unloading model present in service: ${lm.modelId}` });
+        console.log(`Running: foundry model unload ${lm.modelId}`);
         await new Promise((resolve, reject) => {
-          const child = exec(`foundry model unload ${la}`);
+          const child = exec(`foundry model unload ${lm.modelId}`);
           child.stdout.on('data', (d) => { sendEvent({ log: d.toString() }); console.log('unload stdout:', d.toString()); });
           child.stderr.on('data', (d) => { sendEvent({ log: d.toString() }); console.error('unload stderr:', d.toString()); });
-          child.on('close', (code) => { console.log(`foundry model unload ${la} exited with code ${code}`); code === 0 ? resolve() : reject(new Error('unload code ' + code)); });
+          child.on('close', (code) => { console.log(`foundry model unload ${lm.modelId} exited with code ${code}`); code === 0 ? resolve() : reject(new Error('unload code ' + code)); });
           child.on('error', (err) => { console.error('unload error:', err); reject(err); });
         });
-        sendEvent({ log: `Unloaded ${la}` });
+        sendEvent({ log: `Unloaded ${lm.modelId}` });
         // explicitly tell client which alias was unloaded
-        sendEvent({ unloaded: la });
-        console.log(`Unloaded model ${la}`);
-        if (currentLoadedAlias === la) currentLoadedAlias = null;
+        sendEvent({ unloaded: lm.alias });
+        console.log(`Unloaded model ${lm.modelId}`);
+        if (currentLoadedAlias === lm.alias) currentLoadedAlias = null;
       }
       // Wait until all other aliases are gone from service list (small propagation delay)
       const unloadTimeout = 60000; // 60s
@@ -262,9 +357,10 @@ app.get('/load', async (req, res) => {
       sendEvent({ log: 'Warning: error while unloading previous models: ' + e.message });
     }
 
-    // If model already present in service, skip load step
-    if (alreadyLoadedId) {
-      sendEvent({ log: `Model ${alias} already loaded as ${alreadyLoadedId}` });
+
+    // If the exact model is already present in service, skip load step
+    if (alreadyLoadedId === modelId) {
+      sendEvent({ log: `Model ${modelId} already loaded` });
       try { await foundryLocalManager.init(alias); } catch (e) { sendEvent({ log: 'Warning: SDK init failed: ' + e.message }); }
       currentLoadedAlias = alias;
       sendEvent({ done: true, modelId: alreadyLoadedId });
@@ -272,43 +368,56 @@ app.get('/load', async (req, res) => {
       return;
     }
 
-    // Start loading requested model
-    sendEvent({ log: `Loading model: ${alias}` });
-    console.log(`Running: foundry model load ${alias}`);
+    // Start loading requested model by modelId (to get specific variant)
+    sendEvent({ log: `Loading model: ${modelId}` });
+    console.log(`Running: foundry model load ${modelId}`);
     await new Promise((resolve, reject) => {
-      const child = exec(`foundry model load ${alias}`);
+      const child = exec(`foundry model load ${modelId}`);
       child.stdout.on('data', (d) => { sendEvent({ log: d.toString() }); console.log('load stdout:', d.toString()); });
       child.stderr.on('data', (d) => { sendEvent({ log: d.toString() }); console.error('load stderr:', d.toString()); });
-      child.on('close', (code) => { console.log(`foundry model load ${alias} exited with code ${code}`); code === 0 ? resolve() : reject(new Error('load code ' + code)); });
+      child.on('close', (code) => { console.log(`foundry model load ${modelId} exited with code ${code}`); code === 0 ? resolve() : reject(new Error('load code ' + code)); });
       child.on('error', (err) => { console.error('load error:', err); reject(err); });
     });
 
     // Poll service list until alias appears
+    console.log('Starting to poll service list for alias:', alias);
     const timeoutMs = 120000;
     const intervalMs = 1000;
     const start = Date.now();
-    let modelId = null;
+    let loadedModelId = null;
     while (Date.now() - start < timeoutMs) {
-      const id = await findModelInService(alias).catch(()=>null);
-      if (id) { modelId = id; break; }
-      await new Promise(r=>setTimeout(r, intervalMs));
+      const id = await findModelInService(alias).catch(() => null);
+      console.log('Poll result:', id);
+      if (id) { loadedModelId = id; break; }
+      await new Promise(r => setTimeout(r, intervalMs));
     }
-    if (!modelId) {
+    console.log('Polling complete, loadedModelId:', loadedModelId);
+    if (!loadedModelId) {
       sendEvent({ error: 'Model did not appear in service after loading' });
       res.end();
       return;
     }
 
-    // Initialize via SDK
+    // Initialize via SDK with a timeout
+    console.log('Initializing SDK with alias:', alias);
     try {
-      await foundryLocalManager.init(alias);
+      const initTimeout = 10000; // 10 second timeout
+      await Promise.race([
+        foundryLocalManager.init(alias),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('SDK init timed out')), initTimeout))
+      ]);
+      console.log('SDK init complete');
     } catch (e) {
-      sendEvent({ log: 'Warning: SDK init failed: ' + e.message });
+      console.log('SDK init failed or timed out:', e.message);
+      sendEvent({ log: 'Warning: SDK init issue: ' + e.message + ' (continuing anyway)' });
     }
 
+    console.log('Sending done event');
     currentLoadedAlias = alias;
-    sendEvent({ done: true, modelId });
+    currentLoadedModelId = loadedModelId;
+    sendEvent({ done: true, modelId: loadedModelId });
     res.end();
+    console.log('Response ended');
   } catch (e) {
     console.error('Error in /load:', e);
     sendEvent({ error: e.message || String(e) });
@@ -329,29 +438,35 @@ app.get('/chat', async (req, res) => {
   let selectedAlias = aliasRequested;
   let modelId = null;
 
-  // Helper to check service list for alias and return modelId if loaded
-  async function findModelInService(alias) {
-    const { stdout } = await execAsync('foundry service list');
-    const lines = stdout.trim().split('\n');
-    for (let i = 2; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (line.startsWith('🟢')) {
-        const parts = line.split(/\s+/);
-        if (parts.length >= 3) {
-          const a = parts[1];
-          const id = parts.slice(2).join(' ');
-          if (a === alias) return id;
+  // First check if we have a currently loaded model matching the alias
+  if (currentLoadedAlias === aliasRequested && currentLoadedModelId) {
+    modelId = currentLoadedModelId;
+    console.log('Using tracked loaded model:', modelId);
+  } else {
+    // Helper to check service list for alias and return modelId if loaded
+    async function findModelInService(alias) {
+      const { stdout } = await execAsync('foundry service list');
+      const lines = stdout.trim().split('\n');
+      for (let i = 2; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line.startsWith('🟢')) {
+          const parts = line.split(/\s+/);
+          if (parts.length >= 3) {
+            const a = parts[1];
+            const id = parts.slice(2).join(' ');
+            if (a === alias) return id;
+          }
         }
       }
+      return null;
     }
-    return null;
-  }
 
-  try {
-    modelId = await findModelInService(selectedAlias);
-  } catch (error) {
-    console.error('Error checking service list:', error);
-    return res.status(500).json({ error: 'Failed to check service list' });
+    try {
+      modelId = await findModelInService(selectedAlias);
+    } catch (error) {
+      console.error('Error checking service list:', error);
+      return res.status(500).json({ error: 'Failed to check service list' });
+    }
   }
 
   // If not loaded, check cache and load
@@ -411,17 +526,36 @@ app.get('/chat', async (req, res) => {
     }
   }
 
-  // Init the selected model to get the correct endpoint
+  // Init the selected model to get the correct endpoint (with timeout)
+  let endpoint = null;
   try {
-    await foundryLocalManager.init(selectedAlias);
+    const initTimeout = 5000; // 5 second timeout
+    await Promise.race([
+      foundryLocalManager.init(selectedAlias),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('SDK init timed out')), initTimeout))
+    ]);
+    endpoint = foundryLocalManager.endpoint;
   } catch (error) {
-    console.error('Error initializing model:', error);
-    return res.status(500).json({ error: 'Failed to initialize model' });
+    console.error('Error initializing model (will use fallback endpoint):', error.message);
+  }
+
+  // Fallback: use the default Foundry service endpoint
+  if (!endpoint) {
+    try {
+      const statusOutput = await execAsync('foundry service status');
+      const portMatch = statusOutput.stdout.match(/http:\/\/127\.0\.0\.1:(\d+)\//);
+      const servicePort = portMatch ? portMatch[1] : '49808';
+      endpoint = `http://127.0.0.1:${servicePort}/v1`;
+      console.log('Using fallback endpoint:', endpoint);
+    } catch (e) {
+      endpoint = 'http://127.0.0.1:49808/v1';
+      console.log('Using default endpoint:', endpoint);
+    }
   }
 
   // Create OpenAI client with the model's endpoint
   const openai = new OpenAI({
-    baseURL: foundryLocalManager.endpoint,
+    baseURL: endpoint,
     apiKey: 'not-needed',
   });
 
@@ -495,28 +629,42 @@ app.get('/server-models', async (req, res) => {
     const lines = stdout.split('\n');
     const entries = [];
     // parsing: lines include blocks per alias; look for lines with alias at column start
+    let currentAlias = '';
     for (const raw of lines) {
       const line = raw.trim();
-      if (!line) continue;
+      if (!line || line.startsWith('-')) continue; // skip empty and separator lines
       // match lines that start with an alias (non-indented)
       if (!raw.startsWith(' ')) {
         // alias line: Alias Device Task FileSize License ModelID
         const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
-        if (parts.length >= 5) {
-          const alias = parts[0];
-          // next fields may be device/task/filesize/license
+        if (parts.length >= 6) {
+          currentAlias = parts[0];
           const device = parts[1] || '';
           const task = parts[2] || '';
           const fileSize = parts[3] || '';
           const license = parts[4] || '';
-          entries.push({ alias, device, task, fileSize, license, variants: [] });
+          const modelId = parts[5] || '';
+          // Create new entry with first variant from this line
+          entries.push({
+            alias: currentAlias,
+            variants: [{ device, task, fileSize, license, modelId }]
+          });
+        } else if (parts.length >= 1) {
+          // Might be a header or just alias - skip
+          currentAlias = parts[0];
         }
       } else {
         // indented variant lines: Device Task FileSize License ModelID
         const parts = line.split(/\s{2,}/).map(s => s.trim()).filter(Boolean);
         if (parts.length >= 5 && entries.length > 0) {
           const last = entries[entries.length - 1];
-          last.variants.push({ device: parts[0], task: parts[1], fileSize: parts[2], license: parts[3] });
+          last.variants.push({
+            device: parts[0],
+            task: parts[1],
+            fileSize: parts[2],
+            license: parts[3],
+            modelId: parts[4] || ''
+          });
         }
       }
     }
@@ -524,23 +672,30 @@ app.get('/server-models', async (req, res) => {
     // Mark which of these are downloaded by checking cache list
     const cacheOut = await execAsync('foundry cache list');
     const cacheLines = cacheOut.stdout.split('\n');
-    const cachedAliases = new Set();
+    const cachedModelIds = new Set();
     for (const l of cacheLines) {
       const li = l.trim();
       if (li.startsWith('💾')) {
         const p = li.split(/\s+/);
-        if (p.length >= 2) cachedAliases.add(p[1]);
+        if (p.length >= 3) {
+          const cachedModelId = p.slice(2).join(' ');
+          cachedModelIds.add(cachedModelId);
+        }
       }
     }
     // Expand entries to include variant rows for dropdown display
     const flat = [];
     for (const e of entries) {
-      if (e.variants.length === 0) {
-        flat.push({ alias: e.alias, device: '', task: '', fileSize: '', license: '', downloaded: cachedAliases.has(e.alias) });
-      } else {
-        for (const v of e.variants) {
-          flat.push({ alias: e.alias, device: v.device, task: v.task, fileSize: v.fileSize, license: v.license, downloaded: cachedAliases.has(e.alias) });
-        }
+      for (const v of e.variants) {
+        flat.push({
+          alias: e.alias,
+          device: v.device,
+          task: v.task,
+          fileSize: v.fileSize,
+          license: v.license,
+          modelId: v.modelId,
+          downloaded: cachedModelIds.has(v.modelId)
+        });
       }
     }
 
@@ -739,14 +894,37 @@ app.get('/download', (req, res) => {
   })();
 });
 
-// Endpoint to remove a model from the cache (safe, requires alias in body)
+// Endpoint to remove a model from the cache (safe, requires modelId or alias in body)
 app.post('/cache-remove', async (req, res) => {
   try {
+    console.log('/cache-remove received body:', req.body);
+    const modelId = req.body && req.body.modelId;
     const alias = req.body && req.body.alias;
-    if (!alias) return res.status(400).json({ error: 'alias required' });
-    console.log(`Cache remove requested for alias: ${alias}`);
-    // Use exec; include --yes to avoid prompt
-    const cmd = `foundry cache remove ${alias} --yes`;
+    const target = modelId || alias;
+
+    if (!target) return res.status(400).json({ error: 'modelId required' });
+    console.log(`Cache remove requested for: ${target}`);
+
+    // First, unload this specific model from the service if loaded
+    try {
+      const { stdout: svcOut } = await execAsync('foundry service list');
+      if (svcOut.includes(target)) {
+        console.log(`Unloading ${target} before cache remove`);
+        await execAsync(`foundry model unload ${target}`);
+        console.log(`Unloaded ${target}`);
+        // Clear tracked model if it matches
+        if (currentLoadedModelId === target) {
+          currentLoadedAlias = null;
+          currentLoadedModelId = null;
+        }
+      }
+    } catch (unloadErr) {
+      console.log('Warning: error unloading before cache remove:', unloadErr.message);
+    }
+
+    // Now remove from cache using target (modelId)
+    // Note: Use exact ID to remove specific variant if supported, otherwise alias removes all
+    const cmd = `foundry cache remove ${target} --yes`;
     try {
       const { stdout, stderr } = await execAsync(cmd);
       console.log('cache remove stdout:', stdout);
@@ -754,8 +932,14 @@ app.post('/cache-remove', async (req, res) => {
       res.json({ ok: true, stdout: stdout || '', stderr: stderr || '' });
     } catch (e) {
       console.error('Error running cache remove:', e);
-      // include any output if present
-      res.status(500).json({ ok: false, error: e.message || String(e), stdout: e.stdout || '', stderr: e.stderr || '' });
+      const stdout = e.stdout || '';
+      // Check if it actually deleted the model despite the error
+      if (stdout.includes('Deleted model') || stdout.includes('from the cache')) {
+        console.log('Model appeared to be deleted despite error. Treating as success.');
+        res.json({ ok: true, stdout: stdout, stderr: e.stderr || e.message, warning: 'Partial error during removal' });
+      } else {
+        res.status(500).json({ ok: false, error: e.message || String(e), stdout: stdout, stderr: e.stderr || '' });
+      }
     }
   } catch (err) {
     console.error('Error in /cache-remove:', err);
